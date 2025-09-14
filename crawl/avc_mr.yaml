@@ -1,0 +1,72 @@
+# AVC-MR 网站爬虫配置
+# 点击所有 article-card-container 并爬取跳转后的页面内容
+
+tasks:
+  - name: "avc_mr_articles"
+    start_url: "https://www.avc-mr.com"
+
+    browser:
+      timeout: 240 # 页面加载超时4分钟，处理多次跳转
+      js_wait_time: 15 # JavaScript等待15秒，确保动态内容加载
+      max_retries: 5 # 增加重试次数，应对不稳定的网络
+      wait_for_navigation: true # 等待页面导航完成
+      handle_popups: true # 处理弹窗
+
+    button_discovery:
+      selectors:
+        - "div.article-card-container" # 主要选择器
+        - ".article-card-container" # 备用选择器
+      max_buttons: 20 # 合理的数量限制
+      deduplicate: true # 启用智能去重
+      smart_discovery: true # 启用智能发现，避免选择器重叠
+
+    content_extraction:
+      # 文章标题 - 多种可能的标题选择器
+      title: "h1, h2, .article-title, .post-title, .content-title, .entry-title, .page-title, title, .title"
+
+      # 文章正文内容 - 优先级从高到低
+      content: ".article-content, .post-content, .entry-content, .main-content, article, .content, .article-body, .post-body, main p, main div, .text-content"
+
+      # 文章摘要
+      summary: ".article-summary, .post-summary, .summary, .description, .intro, .excerpt"
+
+      # 作者信息
+      author: ".author, .writer, .by-line, .author-name, .post-author, .article-author"
+
+      # 发布时间
+      publish_date: ".publish-date, .post-date, .date, .created-at, .updated-at, time, .timestamp"
+
+      # 标签分类
+      tags: ".tags, .tag, .category, .categories, .post-tags, .article-tags"
+
+      # 文章图片
+      images: "img[src], .article-image img, .content img, .post-image img"
+
+      # 元数据
+      meta_description: "meta[name='description']"
+      meta_keywords: "meta[name='keywords']"
+
+      # 页面所有文本内容（兜底方案）- 更全面的选择器
+      all_text: "p, div, span, h1, h2, h3, h4, h5, h6, article, main, section"
+
+      # 链接信息
+      links: "a[href], .content a, .article-content a"
+
+settings:
+  browser_type: "chromium"
+  headless: false # 保持可见，便于观察多次跳转过程
+  output_dir: "results"
+  storage_type: "json"
+  global_timeout: 400 # 增加全局超时，应对复杂的多跳场景
+
+  # 多跳转处理配置
+  multi_hop:
+    enable: true
+    max_hops: 5 # 最多允许5次跳转
+    wait_between_hops: 3 # 跳转间等待3秒
+
+  # 新标签页处理
+  tab_handling:
+    auto_switch: true # 自动切换到新标签页
+    close_previous: false # 保留之前的标签页用于返回
+    wait_for_load: true # 等待新页面完全加载
