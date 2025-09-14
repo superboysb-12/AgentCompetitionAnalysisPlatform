@@ -1,0 +1,83 @@
+# Daikin Applied 产品爬虫配置
+# 爬取 Unit Ventilators 产品页面内容
+
+tasks:
+  - name: "daikin_unit_ventilators"
+    start_url: "https://www.daikinapplied.com/products/unit-ventilators"
+
+    browser:
+      timeout: 180  # 页面加载超时3分钟
+      js_wait_time: 10  # JavaScript等待10秒，确保动态内容加载
+      max_retries: 3  # 重试次数
+      wait_for_navigation: true  # 等待页面导航完成
+      handle_popups: true  # 处理可能的弹窗
+
+    button_discovery:
+      selectors:
+        # 基于页面分析的选择器
+        - ".product-family-page img + a"  # 产品图片后的链接
+        - "a[href*='/products/']"  # 包含产品路径的链接
+        - ".nav-menu a[href^='/products/']"  # 导航菜单中的产品链接
+        - "a[href*='unit-ventilator']"  # 包含unit-ventilator的链接
+        - ".product-link"  # 通用产品链接类
+        - "a[data-product]"  # 带有产品数据属性的链接
+        - ".btn-primary"  # 主要按钮
+      max_buttons: 15  # 合理的数量限制
+      deduplicate: true  # 启用智能去重
+      smart_discovery: true  # 启用智能发现
+
+    content_extraction:
+      # 产品标题
+      title: "h1, h2, .product-title, .page-title, title, .hero-title"
+
+      # 产品描述
+      description: ".product-description, .hero-description, .product-overview, .description"
+
+      # 产品特性
+      features: ".features-section, .features, .product-features, .benefits"
+
+      # 规格信息
+      specifications: ".specifications, .specs, .product-specs, .technical-data"
+
+      # 资源下载
+      resources: ".resources-downloads, .downloads, .resources, .documentation"
+
+      # 产品图片
+      images: "img[src*='product'], .product-image img, .hero-image img, img[alt*='unit']"
+
+      # 文档链接
+      documents: "a[href$='.pdf'], a[href*='download'], .download-link"
+
+      # 产品型号
+      model: ".model, .product-model, .part-number"
+
+      # 应用场景
+      applications: ".applications, .uses, .suitable-for"
+
+      # 页面主要内容（兜底方案）
+      main_content: "main, .main-content, .content, .page-content"
+
+      # 所有文本内容（最后备选）
+      all_text: "p, div, span, h1, h2, h3, h4, h5, h6, article, main, section"
+
+      # 所有链接
+      links: "a[href]"
+
+settings:
+  browser_type: "chromium"
+  headless: false  # 保持可见，便于观察抓取过程
+  output_dir: "results"
+  storage_type: "json"
+  global_timeout: 300  # 全局超时5分钟
+
+  # 多跳转处理配置
+  multi_hop:
+    enable: true
+    max_hops: 3  # 最多允许3次跳转
+    wait_between_hops: 2  # 跳转间等待2秒
+
+  # 新标签页处理
+  tab_handling:
+    auto_switch: true  # 自动切换到新标签页
+    close_previous: false  # 保留之前的标签页
+    wait_for_load: true  # 等待新页面完全加载

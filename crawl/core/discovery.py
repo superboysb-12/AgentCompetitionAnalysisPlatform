@@ -16,34 +16,45 @@ class ButtonDiscovery:
     """按钮发现器 - 识别页面中的可点击元素"""
 
     async def discover_buttons(self, page: Page, config: Dict[str, Any]) -> List[ButtonInfo]:
-        """发现页面中的可点击按钮 - 智能去重保持通用性"""
+        """发现页面中的可点击按钮 - 智能去重保持通用性
+
+        算法流程：
+        1. 获取配置参数（CSS选择器、最大数量等）
+        2. 如果启用智能发现，先优化选择器列表去重
+        3. 遍历每个选择器，找到匹配的元素
+        4. 检查元素的可见性和可点击性
+        5. 如果开启去重，根据元素特征进行智能去重
+        6. 提取按钮信息并返回结果
+        """
         buttons = []
-        seen_elements = set()  # 用于去重
+        seen_elements = set()  # 用于存储已发现元素的特征签名，避免重复
         selectors = config.get('selectors', [])
         max_buttons = config.get('max_buttons', 10)
-        deduplicate = config.get('deduplicate', False)
-        smart_discovery = config.get('smart_discovery', False)
+        deduplicate = config.get('deduplicate', False)  # 是否开启智能去重
+        smart_discovery = config.get('smart_discovery', False)  # 是否启用智能发现模式
 
-        # 智能发现模式：先分析选择器重叠情况
+        # 如果开启智能发现模式且有多个选择器，先分析选择器重叠情况
+        # 目标：减少重复工作，提高发现效率
         if smart_discovery and len(selectors) > 1:
             selectors = await self._optimize_selectors(page, selectors)
 
         for selector in selectors:
             try:
-                # 等待元素出现并使用定位器
+                # 使用Playwright的Locator API获取元素，更加稳定和高效
                 locator = page.locator(selector)
-                count = await locator.count()
+                count = await locator.count()  # 获取匹配元素数量
                 logger.info(f"选择器 {selector} 找到 {count} 个元素")
 
+                # 遍历所有匹配的元素，但不超过限制数量
                 for i in range(min(count, max_buttons - len(buttons))):
                     try:
-                        element_locator = locator.nth(i)
+                        element_locator = locator.nth(i)  # 获取第 i 个匹配元素
 
                         # 等待元素可见并检查是否可点击
                         await element_locator.wait_for(state='visible', timeout=5000)
 
                         if await self._is_locator_clickable(element_locator):
-                            # 智能去重：检查是否为重复元素
+                            # 智能去重：根据元素的多个特征检查是否为重复元素
                             if deduplicate:
                                 element_signature = await self._get_element_signature(element_locator)
                                 if element_signature in seen_elements:
@@ -51,10 +62,12 @@ class ButtonDiscovery:
                                     continue
                                 seen_elements.add(element_signature)
 
+                            # 提取按钮元素的详细信息
                             button_info = await self._extract_button_info_from_locator(element_locator, selector, i)
                             buttons.append(button_info)
                             logger.info(f"添加按钮 #{len(buttons)}: {button_info.text[:50]}...")
 
+                        # 检查是否达到最大数量限制
                         if len(buttons) >= max_buttons:
                             break
 
@@ -112,7 +125,15 @@ class ButtonDiscovery:
         return core1 in core2 or core2 in core1
 
     async def _get_element_signature(self, locator) -> str:
-        """获取元素的综合签名用于智能去重"""
+        """获取元素的综合签名用于智能去重
+
+        算法：组合多个元素特征构建唯一标识：
+        1. ID属性（最优先）
+        2. 位置信息（x, y 坐标）
+        3. 文本内容
+        4. href 属性
+        5. class 属性
+        """
         try:
             # 获取元素在DOM中的位置信息
             bounding_box = await locator.bounding_box()
@@ -121,13 +142,13 @@ class ButtonDiscovery:
             element_id = await locator.get_attribute('id')
             class_name = await locator.get_attribute('class')
 
-            # 构建综合签名
+            # 组合多个属性构建综合签名。位置信息特别重要，因为相同元素不会在同一位置
             signature_parts = []
 
             if element_id:
                 signature_parts.append(f"id:{element_id}")
             if bounding_box:
-                # 使用位置信息作为签名的一部分
+                # 使用像素位置信息作为签名的重要部分
                 pos = f"pos:{int(bounding_box['x'])}_{int(bounding_box['y'])}"
                 signature_parts.append(pos)
             if text_content:
@@ -184,21 +205,30 @@ class ButtonDiscovery:
             return False
 
     async def _extract_button_info_from_locator(self, locator, selector: str, index: int) -> ButtonInfo:
-        """从定位器提取按钮信息"""
+        """从Platwright定位器提取按钮信息
+
+        提取信息包括：
+        - 文本内容（限制长度避免过长）
+        - href 属性（链接目标）
+        - onclick 属性（JavaScript事件）
+        - target 属性（打开方式）
+        - 索引信息（用于后续重新定位）
+        """
         try:
+            # 提取元素的各项属性
             text = await locator.text_content() or ""
             href = await locator.get_attribute('href')
             onclick = await locator.get_attribute('onclick')
             target = await locator.get_attribute('target')
 
             return ButtonInfo(
-                element=None,  # 不存储元素句柄
+                element=None,  # 不存储元素句柄避免内存泄漏
                 selector=selector,
-                text=text[:100],
+                text=text[:100],  # 限制文本长度避免过长日志
                 href=href,
                 onclick=onclick,
                 target=target,
-                index=index  # 添加索引用于重新定位
+                index=index  # 保存索引信息用于后续重新定位元素
             )
         except Exception as e:
             logger.warning(f"按钮信息提取失败: {e}")

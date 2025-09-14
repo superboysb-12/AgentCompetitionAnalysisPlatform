@@ -1,0 +1,361 @@
+{
+  "task_name": "daikin_direct_crawl",
+  "timestamp": "2025-09-14T22:45:58.876237",
+  "total_results": 1,
+  "successful_results": 1,
+  "results": [
+    {
+      "url": "https://www.daikinapplied.com/products/unit-ventilators",
+      "original_url": "https://www.daikinapplied.com/products/unit-ventilators",
+      "content": {
+        "title": [
+          "Reduce Operating CostsWhile Matching Classroom Requirements"
+        ],
+        "description": null,
+        "products": [
+          "Reduce Operating CostsWhile Matching Classroom Requirements\n        \n    \n    \n        \n            \n                \n                    Take a look inside"
+        ],
+        "product_names": [
+          "Products",
+          "Industry Solutions",
+          "Resources",
+          "Models UAHB, UAHF, UAHR, UAHV, AV, AVB, AVR, AVS, AVV, UAVB, UAVR, UAVS, UAVV, AZQ, AZR, AZU, UAZQ, UAZR, UAZU, AR, ARQ, GRQ, UARQ, UERQ, UGRQ, AEQ, UAEQ",
+          "Built-up Ceiling Unit",
+          "Quiet Operation with GentleFlo®",
+          "Draw-through Design",
+          "Get In Touch",
+          "Daikin Global Locations"
+        ],
+        "product_descriptions": null,
+        "product_links": [
+          "AEQ",
+          "AGZ-E",
+          "AGZ-F",
+          "AR",
+          "ARQ",
+          "AV",
+          "AVB",
+          "AVR",
+          "AVS",
+          "AVV",
+          "AWV",
+          "AZQ",
+          "AZR",
+          "AZU",
+          "BCH",
+          "BCV",
+          "BCA",
+          "CAC",
+          "CAC (Custom)",
+          "CAH",
+          "CAH (Custom)",
+          "CCH",
+          "CCW",
+          "DAH",
+          "DAP",
+          "DFSA",
+          "DPS",
+          "DPSA",
+          "E-F",
+          "E-F5",
+          "EWYQ",
+          "FCHC",
+          "FCHH",
+          "FCHR",
+          "FCVC",
+          "FCVH",
+          "FCVS",
+          "FHHC",
+          "FHHH",
+          "FHHR",
+          "FHVC",
+          "FHVH",
+          "FHVS",
+          "FHWC",
+          "FSG",
+          "GCV",
+          "GCH",
+          "GDH",
+          "GRQ",
+          "GSH",
+          "GSV",
+          "GTH",
+          "GTV",
+          "Hi-5",
+          "Hi-F",
+          "Hi-F5",
+          "Hi-F8",
+          "HSC",
+          "LVC",
+          "LVW",
+          "Modular Solutions",
+          "MHC",
+          "MHW",
+          "MPS I",
+          "MPS II",
+          "MQFCI6",
+          "MQFVI5",
+          "MQTHI5",
+          "OAC",
+          "OAH",
+          "RAH",
+          "RCS",
+          "RDE",
+          "RDT",
+          "RFS",
+          "RPE",
+          "RPS",
+          "SiteLine™",
+          "SCH",
+          "SMH",
+          "SSH",
+          "SVC",
+          "SVF",
+          "SWP",
+          "TSC",
+          "UAEQ",
+          "UAHB",
+          "UAHF",
+          "UAHR",
+          "UAHV",
+          "UARQ",
+          "UAVB",
+          "UAVR",
+          "UAVS",
+          "UAVV",
+          "UAZQ",
+          "UAZR",
+          "UAZU",
+          "UDH",
+          "UERQ",
+          "UGRQ",
+          "UHH",
+          "VFC",
+          "VFW",
+          "WDC",
+          "WMC",
+          "WME",
+          "WMT",
+          "WSC",
+          "WSCH",
+          "WSCV",
+          "WSMH",
+          "WSMV",
+          "WSRC",
+          "WSSH",
+          "WSSV",
+          "WSTV",
+          "WSVC",
+          "WSVF",
+          "WVHC",
+          "WVHF",
+          "WVHW",
+          "WWV",
+          "Rentals",
+          "Rooftop Systems",
+          "Air Handlers",
+          "Chillers",
+          "Fan Coils",
+          "Condensing Units",
+          "Self-Contained Systems",
+          "Water Source Heat Pumps",
+          "Modular Solutions",
+          "VAV Terminal Units",
+          "Unit Ventilators",
+          "Coils",
+          "Daikin Air Purifiers",
+          "SiteLine Building Controls",
+          "Rental Solutions",
+          "Product Catalogs"
+        ],
+        "navigation": null,
+        "images": [
+          {
+            "src": "/App_Themes/SiteTheme/Global/assets/img/daikin-logo.png",
+            "alt": "Daikin logo"
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/products.png?sfvrsn=86575c71_2",
+            "alt": "Products"
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/hero-images-(product-family-pages)/rooftop-systems_2bf88548-24b4-4f64-8053-dc8345e5e6a9.png?sfvrsn=eba63bbb_2",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-vision70f26527-ebd5-4591-89bc-b4736aee40bf.png?sfvrsn=3e97b44c_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/about-us/menu-chillers-v3.png?sfvrsn=73cecbd_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-fan-coild2aa06d1-f36c-4da7-8779-5619cd001193.png?sfvrsn=ba10fbfc_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-condensing-unitf6d93f2f-2545-45af-b9e0-d4f7a04918a4.png?sfvrsn=296e105_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/default-album/menu-self.png?sfvrsn=b5a0109a_3",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-wshp1ff745208-d1fa-45c2-af9a-da1db6865026.png?sfvrsn=c7630be4_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-mcpf6badb85-5784-4e65-b490-6eb434807ff4.png?sfvrsn=92b40b1e_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-vav66ab8f65-579f-4437-99dd-7b031e38b0a0.png?sfvrsn=f5b4815e_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-unit-ventilator902c580d-62d4-422f-8f4d-638ec62684bb.png?sfvrsn=3cbce0ed_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-coilsa68b4453-de4e-4267-85ee-b2ba94d7bb1b.png?sfvrsn=83501b3e_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/about-us/air-purifiers.png?sfvrsn=1085184f_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/menu-controls5e9fefd6-ab1f-4592-9216-991875259bd6.png?sfvrsn=415b4254_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/rental-chillers1859d620-3cfb-4c79-9138-acaa6e2d039f.png?sfvrsn=83592292_1",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/industry-solutions.png?sfvrsn=fad00ee2_2",
+            "alt": "Industry Solutions"
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/resources.png?sfvrsn=f1a8a665_2",
+            "alt": "Resources"
+          },
+          {
+            "src": "/App_Themes/SiteTheme/Global/assets/img/AllSolutionsIcon.png",
+            "alt": null
+          },
+          {
+            "src": "https://dotcom.blob.core.windows.net/sitefinity/images/default-source/installation-photos/resources-thumbnails/product-catalogs.png?sfvrsn=98dd6889_2",
+            "alt": null
+          }
+        ],
+        "main_content": [
+          "Built-up Ceiling Unit\n    \n    \n        Our unit ventilators are inexpensive to install and operate, and they \nare designed with dependable, efficient features that provide years of \ntrouble-free service.\n    \n\n\n\n\n\n        \n\n\n\n    \n        Quiet Operation with GentleFlo®\n    \n    \n        These units operate very quietly due to the GentleFlo® air moving system.\n    \n\n\n\n\n\n        \n\n\n\n    \n        Draw-through Design\n    \n    \n        Enjoy superior temperature and dehumidification control due to the unit's draw-through design with face and bypass damper.\n    \n\n\n        \n        \n            \n\n\nResources & Downloads\n\n    All Solutions Catalog\n                        \n                             Catalogs \n\n                            \n                                \n                                        Classroom Ceiling Unit Ventilators - CAT 1661-1\n                                        Classroom Floor Unit Ventilators - CAT 1660-1\n                                        R-32 Self-Contained Air Source Heat Pump - CAT 1664\n                                        R-32 Self-Contained WSHP - CAT 1663\n                                        Classroom Self-Contained - CAT 1662\n                                        Classroom Floor - CAT 1600\n                                        Self-Contained Air Source Heat Pump - CAT 1650\n                                        Classroom Ceiling - CAT 1610\n                                        Self-Contained WSHP - CAT 1640\n                                        Classroom Self-Contained - CAT 1620\n                                \n                            \n\n                        \n                        \n                             Installation and Operation Manuals \n\n                            \n                                \n                                        Unit\n                                        \n                                            \n                                                                                                    Ceiling Unit Ventilators - IM 830\n                                                    Floor Unit Ventilators - IM 817\n                                                    Self-Contained Unit Ventilator - IM 1065\n                                                    R-32 Self-Contained Unit Ventilator ARQ/GRQ - IM 1392\n                                                    R-32 Self-Contained Air-Source Heat Pump Unit Ventilator AEQ - IM 1386\n                                                    R-32 Self-Contained Unit Ventilator - IM 1391-1\n                                                    R-32 Floor Unit Ventilator - IM 1396-1\n                                                    R-32 Ceiling Unit Ventilator - IM 1399-1\n                                                    Self-Contained Unit Ventilator ARQ/GRQ - IM 1083\n                                                    Self-Contained Air-source Heat Pump Unit Ventilator AEQ - IM 1082\n\n                                            \n                                        \n                                        Control\n                                        \n                                            \n                                                                                                    MicroTech LonWorks Communication Module - IM 1307-1\n                                                    Unit Ventilator MicroTech II Conversion to MicroTech UV Controller - IM 1320-1\n                                                    MicroTech Unit Ventilator Controller - OM 1280-6\n                                                    ATS ServiceTools Software for MicroTech Controllers  - OM 732-6\n                                                    4-Button Digital Sensor - IM 1278\n                                                    6-Button Digital Room Sensor - IM 1279\n                                                    Room Sensors Kit - IM 1277\n                                                    MicroTech Controls LUI Kit - IM 1282-1\n                                                    MicroTech Controller - IM 1286-3\n\n                                            \n                                        \n                                        Accessory\n                                        \n                                            \n                                                                                                    Auxiliary Drain Pan Kit - IM 1305\n                                                    Louver and Shutter - IM 473\n                                                    Louver Kit - IM 1066\n                                                    Wall Sleeve Kit - IM 1073\n\n                                            \n                                        \n                                \n\n                            \n\n                        \n                        \n                             Sales and Engineering Data \n\n                            \n                                \n                                        Unit Ventilator MicroTech Controls Protocol Information - ED 19110\n                                        Geothermal WSHP GRQ Cooling and Heating Capacity Data - ED 18525\n                                        Self-Contained ARQ/ERQ Cooling and Heating Capacity Data - ED 18526\n                                        Self-Contained AEQ Capacity Data - ED 18528\n                                        Self-Contained AZ Cooling Capacity Data  - ED 18506\n                                        DraftStop Application Guide - ED 19038\n                                        Floor Unit (F-Vintage) Hot Water Coil Heating Capacity Data - ED 18508\n                                        Classroom Ceiling (F-Vintage) Hot Water Coil Heating Capacity Data - ED 18518\n                                        Classroom Ceiling Cooling Capacity Data - ED 18517\n                                        Classroom Ceiling Direct Expansion Cooling Coil Capacity Data - ED 18521\n                                        Classroom Ceiling Steam Coil Heating Capacity Data - ED 18519\n                                        Floor Unit (F-Vintage) Sound Power Ratings - ED 18512\n                                        Floor Unit (F-Vintage) Direct Expansion (DX) Cooling Coil Capacity Data - ED 18511\n                                        Floor Unit (F-Vintate) Electric Heat Capacity Data - ED 18510\n                                        Floor Unit (F-Vintage) Steam Coil Heating Capacity Data - ED 18509\n                                        Classroom Floor Unit Cooling Capacity Data - ED 18507\n                                \n                            \n\n                        \n                    Revit (BIM) Files\n                    Brochures\n                        \n                             Case Studies \n\n                            \n                                    \n                                    \n                                    \n                                            K-12 Education\n                                            \n                                                \n                                                        East Woods Elementary School\n                                                        White Plains High School\n                                                \n                                            \n                                    \n\n\n                            \n\n                        \n                        \n                             Application Software \n\n                            \n                                \n                                        Application Software for MicroTech® Unit Ventilator Version 3.00\n                                        ATS ServiceTools for MicroTech® Unit Controller Software, Version 3.1.0\n                                        MicroTech UV LonWorks Application Software  v1_2\n                                \n                            \n\n                        \n\n\n\n\n\nPerformance\n\n\n\n\n\n     Ceiling Units - 750 to 2000 CFM\n\n\n\n\n     Floor Units - 750 to 1500 CFM\n\n\n\n\n     Self-Contained, Heat Pump and WSHP Floor Units - 24-54 MBH\n\n\nFeatures\n\n\n    Built-up floor and ceiling units, plus air source air conditioner, air-to-air heat pump or water source heat pump (boiler/tower and geothermal)\n    Draw-through design with face and bypass damper control for superior temperature and dehumidification control\n    GentleFlo® air moving system for very quiet operation\n    Welded frame construction and industrial strength cabinet and finish for long life\n    Unique draw-thru design provides uniform air distribution across the coil for even discharge air temperatures\n    Controls flexibility with MicroTech® for unit ventilators\n    Digital Ready® feature provides industry standard Direct Digital Control (DDC) components for easy integration of unit controllers by others\n    Economizer, Demand Control Ventilation (DCV) and part load, variable air options allow you to reduce operating costs while closely matching classroom comfort requirements"
+        ],
+        "all_text": [
+          "Daikin is devoted to overcoming the evolving challenges of air while creating better, more sustainable outcomes for customers and communities. Daikin products are built on our core set of key technologies, which we can adapt for any climate need,\n        at any scale. In doing so, Daikin sets the standard for economic and efficient air management solutions worldwide.",
+          "Daikin Applied's commitment to innovating beyond today has resulted in proven solutions for commercial, industrial and institutional buildings. Our expertise and continuous investments in advanced technology and sustainability set Daikin Applied apart\n        as a proven partner. Visit the Daikin Applied Solutions Plaza for a hands-on experience.",
+          "Daikin Applied delivers superior air quality and energy efficiency to every solution with innovation in advanced technology, IoT, and next generation compressors. Daikin branded products, solutions, and services are sold through a global network of\n        dedicated sales, service, and parts offices.",
+          "Daikin's unit ventilators use advanced HVAC technology to reduce operating costs while closely matching classroom comfort requirements. For nearly a century, schools have relied on unit ventilators to keep classrooms comfortable. Since 1918, Daikin and\n    its legacy brands have remained an industry leader by meeting the changing requirements of schools with the highest quality unit ventilator products available. In addition, we realize that keeping expenditures down is a high priority for school administrators\n    and school boards. Our unit ventilators are inexpensive to install and operate, and they are designed with dependable, efficient features that provide years of trouble-free service.",
+          "Our unit ventilators are inexpensive to install and operate, and they \nare designed with dependable, efficient features that provide years of \ntrouble-free service.",
+          "These units operate very quietly due to the GentleFlo® air moving system.",
+          "Enjoy superior temperature and dehumidification control due to the unit's draw-through design with face and bypass damper.",
+          "13600 Industrial Park Blvd\n                    Minneapolis, MN 55441",
+          "800.432.1342     Toll Free\n                    763.553.5330     Direct"
+        ],
+        "links": [
+          {
+            "href": "/",
+            "text": ""
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AEQ"
+          },
+          {
+            "href": "/products/chiller-products/trailblazer",
+            "text": "AGZ-E"
+          },
+          {
+            "href": "/products/chiller-products/trailblazer",
+            "text": "AGZ-F"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AR"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "ARQ"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AV"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AVB"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AVR"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AVS"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AVV"
+          },
+          {
+            "href": "/products/chiller-products/pathfinder",
+            "text": "AWV"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AZQ"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AZR"
+          },
+          {
+            "href": "/products/unit-ventilators",
+            "text": "AZU"
+          },
+          {
+            "href": "/products/air-handlers/preciseline",
+            "text": "BCH"
+          },
+          {
+            "href": "/products/air-handlers/preciseline",
+            "text": "BCV"
+          },
+          {
+            "href": "/products/air-handlers/preciseline",
+            "text": "BCA"
+          },
+          {
+            "href": "/products/air-handlers/vision",
+            "text": "CAC"
+          },
+          {
+            "href": "/products/air-handlers/custom-air-handler",
+            "text": "CAC (Custom)"
+          }
+        ]
+      },
+      "timestamp": "2025-09-14T22:45:58.876237",
+      "new_tab": false,
+      "strategy_used": null,
+      "button_info": {
+        "text": "",
+        "selector": "",
+        "href": null
+      }
+    }
+  ]
+}

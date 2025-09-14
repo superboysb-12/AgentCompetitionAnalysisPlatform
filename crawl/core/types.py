@@ -26,6 +26,12 @@ class ClickStrategy(Enum):
     INTERNAL_LINK = "internal_link"
 
 
+class CrawlMode(Enum):
+    """爬取模式枚举"""
+    DIRECT = "direct"      # 直接爬取模式：直接爬取页面内容，不点击按钮
+    INDIRECT = "indirect"  # 间接爬取模式：点击按钮后跳转到新页面爬取内容
+
+
 @dataclass
 class CrawlResult:
     url: str

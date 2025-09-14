@@ -1,0 +1,58 @@
+# Daikin Applied 产品爬虫配置 - 直接爬取模式
+# 直接爬取页面内容，不点击任何按钮
+
+tasks:
+  - name: "daikin_direct_crawl"
+    mode: "direct"  # 关键配置：直接爬取模式
+    start_url: "https://www.daikinapplied.com/products/unit-ventilators"
+
+    browser:
+      timeout: 120  # 页面加载超时2分钟
+      js_wait_time: 8  # JavaScript等待8秒
+      max_retries: 3  # 重试次数
+      wait_for_navigation: true  # 等待页面导航完成
+      handle_popups: true  # 处理可能的弹窗
+
+    # 直接爬取模式下不需要button_discovery配置
+    # button_discovery配置会被忽略
+
+    content_extraction:
+      # 页面主标题
+      title: "h1, h2, .page-title, .hero-title, title"
+
+      # 页面描述
+      description: ".hero-description, .page-description, .overview"
+
+      # 产品列表
+      products: ".product-card, .product-item, .product"
+
+      # 产品名称
+      product_names: ".product-title, .product-name, h3, h4"
+
+      # 产品描述
+      product_descriptions: ".product-description, .product-summary"
+
+      # 产品链接
+      product_links: "a[href*='product'], .product-link"
+
+      # 导航菜单
+      navigation: ".nav-menu, .navigation"
+
+      # 所有图片
+      images: "img[src], .product-image img"
+
+      # 主要内容区域
+      main_content: "main, .main-content, .content"
+
+      # 所有文本内容（兜底方案）
+      all_text: "p, div, span, h1, h2, h3, h4, h5, h6, li"
+
+      # 所有链接
+      links: "a[href]"
+
+settings:
+  browser_type: "chromium"
+  headless: false  # 保持可见，便于观察
+  output_dir: "results"
+  storage_type: "json"
+  global_timeout: 180

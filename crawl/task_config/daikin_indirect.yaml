@@ -1,0 +1,60 @@
+# Daikin Applied 产品爬虫配置 - 间接爬取模式
+# 点击页面中的指定按钮，然后在跳转后的页面进行爬取
+
+tasks:
+  - name: "daikin_indirect_crawl"
+    mode: "indirect"  # 关键配置：间接爬取模式（默认值）
+    start_url: "https://www.daikinapplied.com/products/unit-ventilators"
+
+    browser:
+      timeout: 180  # 页面加载超时3分钟
+      js_wait_time: 10  # JavaScript等待10秒
+      max_retries: 3  # 重试次数
+      wait_for_navigation: true  # 等待页面导航完成
+      handle_popups: true  # 处理可能的弹窗
+
+    button_discovery:
+      selectors:
+        # 只点击特定的按钮/链接
+        - "a[href*='/products/unit-ventilator']"  # 具体产品链接
+        - ".product-link"  # 产品链接类
+        - "a[data-product]"  # 带有产品数据属性的链接
+        - ".btn-primary"  # 主要按钮
+        # 避免使用过于宽泛的选择器，如 "a" 或 "button"
+      max_buttons: 10  # 限制按钮数量
+      deduplicate: true  # 启用去重
+      smart_discovery: true  # 智能发现
+
+    content_extraction:
+      # 产品页面的内容提取
+      title: "h1, h2, .product-title, .page-title"
+      description: ".product-description, .description, .overview"
+      specifications: ".specifications, .specs, .technical-data"
+      features: ".features, .benefits"
+      images: "img[src*='product'], .product-image img"
+      documents: "a[href$='.pdf'], .download-link"
+      model: ".model, .part-number"
+      applications: ".applications, .uses"
+
+      # 主要内容区域（兜底）
+      main_content: "main, .main-content, .content"
+      all_text: "p, div, span, h1, h2, h3, h4, h5, h6"
+
+settings:
+  browser_type: "chromium"
+  headless: false  # 保持可见
+  output_dir: "results"
+  storage_type: "json"
+  global_timeout: 300
+
+  # 多跳转处理配置
+  multi_hop:
+    enable: true
+    max_hops: 3
+    wait_between_hops: 2
+
+  # 新标签页处理
+  tab_handling:
+    auto_switch: true
+    close_previous: false
+    wait_for_load: true
