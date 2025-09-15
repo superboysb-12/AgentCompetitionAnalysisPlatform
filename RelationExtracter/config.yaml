@@ -1,0 +1,139 @@
+# 关系提取器配置文件
+# 支持多种预定义schema和模型配置
+
+# 默认schema定义
+schemas:
+  # 通用信息抽取schema
+  general:
+    人物: ["头衔", "所属机构", "观点"]
+    产品: ["型号", "技术亮点", "应用场景"]
+    活动: ["时间", "地点", "主办方"]
+
+  # 商业分析schema
+  business:
+    公司: ["名称", "业务范围", "产品", "市场地位"]
+    高管: ["姓名", "职位", "公司", "主要观点"]
+    产品: ["名称", "特点", "技术优势", "目标市场"]
+    合作: ["合作方", "合作内容", "合作时间"]
+
+  # 新闻事件schema
+  news:
+    事件: ["名称", "时间", "地点", "参与方"]
+    人物: ["姓名", "身份", "言论", "行为"]
+    机构: ["名称", "类型", "作用", "态度"]
+
+  # 技术分析schema
+  technology:
+    技术: ["名称", "类型", "特点", "应用领域"]
+    产品: ["名称", "技术规格", "性能指标", "创新点"]
+    公司: ["名称", "技术实力", "研发方向", "产品线"]
+
+# 预定义配置
+configs:
+  # 标准配置
+  standard:
+    schema_key: "general"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 8
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 4
+    text_processing:
+      chunk_min: 300
+      chunk_max: 800
+      stride_ratio: 0.25
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
+
+  # 高性能配置
+  high_performance:
+    schema_key: "general"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 16
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 8
+    text_processing:
+      chunk_min: 300
+      chunk_max: 800
+      stride_ratio: 0.25
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
+
+  # 内存优化配置
+  memory_optimized:
+    schema_key: "general"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 4
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 2
+    text_processing:
+      chunk_min: 300
+      chunk_max: 500
+      stride_ratio: 0.25
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
+
+  # 商业分析配置
+  business_analysis:
+    schema_key: "business"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 12
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 4
+    text_processing:
+      chunk_min: 300
+      chunk_max: 800
+      stride_ratio: 0.25
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
+
+  # 新闻分析配置
+  news_analysis:
+    schema_key: "news"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 8
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 4
+    text_processing:
+      chunk_min: 300
+      chunk_max: 600
+      stride_ratio: 0.3
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
+
+  # 技术分析配置
+  tech_analysis:
+    schema_key: "technology"
+    model:
+      name: "paddlenlp/PP-UIE-0.5B"
+      batch_size: 10
+      precision: "bfloat16"
+      schema_lang: "zh"
+      max_workers: 4
+    text_processing:
+      chunk_min: 300
+      chunk_max: 800
+      stride_ratio: 0.25
+      dedup_min_length: 20
+      fingerprint_length: 80
+    logging:
+      level: "INFO"
