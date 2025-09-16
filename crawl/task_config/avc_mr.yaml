@@ -7,10 +7,19 @@ tasks:
 
     browser:
       timeout: 240 # 页面加载超时4分钟，处理多次跳转
-      js_wait_time: 15 # JavaScript等待15秒，确保动态内容加载
+      js_wait_time: 3 # JavaScript等待3秒（优化后）
+      fast_js_wait_time: 1 # 快速模式下JS等待时间
       max_retries: 5 # 增加重试次数，应对不稳定的网络
       wait_for_navigation: true # 等待页面导航完成
       handle_popups: true # 处理弹窗
+
+      # 新增性能优化配置
+      fast_mode: true # 启用快速等待模式（适用于已加载的新标签页）
+      wait_for_networkidle: false # 不等待网络空闲，加快速度
+      check_content_stability: false # 禁用内容稳定性检测，已加载页面不需要
+      network_timeout: 10000 # 网络超时10秒
+      network_wait_attempts: 2 # 网络等待重试次数
+      stability_check_interval: 1 # 内容稳定性检查间隔1秒
 
     button_discovery:
       selectors:
