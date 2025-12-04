@@ -1,0 +1,113 @@
+# ---------------------------
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Data directories
+data/
+output/
+LLMRelationExtracter/data/
+LLMRelationExtracter/output/
+
+# Checkpoints and models
+checkpoints/
+*.pth
+*.ckpt
+*.pt
+*.safetensors
+TextClassification/roberta_model/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+
+# Temporary files
+*.tmp
+*.bak
+temp/
+tmp/
+
+# ---------------------------
+# Ignore ALL YAML / JSON...
+*.yml
+*.yaml
+*.json
+
+# ...but keep commonly-needed ones (按需保留/删除)
+!package.json
+!package-lock.json
+!pnpm-lock.yaml
+!yarn.lock
+
+# 你之前的敏感配置规则：忽略具体配置，但保留示例
+# 注意：因为上面已经全局忽略了 *.yaml，这里加一条“包括示例”的反选
+!**/config/config.yaml.example
+**/config/config.yaml
+
+# （如需保留其他特定 JSON/YAML，在下面继续用 ! 加回来）
+# !path/to/needed.json
+# !some/dir/config.yaml
+# ---------------------------

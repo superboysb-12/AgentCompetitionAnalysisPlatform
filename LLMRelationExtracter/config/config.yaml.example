@@ -1,0 +1,873 @@
+model:
+  # 支持的模型类型: openai, azure, deepseek, qwen, etc.
+  provider: "openai"
+  model_name: "gpt-4.1-mini"
+  api_key: "your-api-key-here"
+  api_base: "https://api.openai.com/v1/"
+  max_tokens: 200
+  temperature: 0.1
+  timeout: 3000
+
+# 实体类型定义 (支持灵活配置)
+entity_types:
+  品牌:
+    description: "空调产品的品牌信息，如制造商品牌或独立品牌"
+    examples: ["格力", "美的", "海尔", "大金", "日立"]
+    attributes:
+      品牌历史:
+        value_type: "文本"
+        description: "品牌的创立时间和发展历程"
+      市场定位:
+        value_type: "枚举"
+        description: "品牌的市场定位（高端/中端/低端）"
+      品牌影响力:
+        value_type: "文本"
+        description: "品牌在市场中的影响力描述"
+
+  系列:
+    description: "某个品牌下的一个产品线或系列"
+    examples: ["海信耀享系列", "格力T爽系列", "美的风尊系列"]
+    attributes:
+      系列特色:
+        value_type: "文本"
+        description: "系列的主要特点和卖点"
+      目标用户群:
+        value_type: "文本"
+        description: "系列面向的目标用户群体"
+
+  品类:
+    description: "空调的宏观分类"
+    examples:
+      ["壁挂式空调", "立柜式空调", "中央空调", "单冷型", "热泵型", "热泵冷暖型"]
+    attributes:
+      安装方式:
+        value_type: "枚举"
+        description: "空调的安装方式（壁挂/立柜/中央等）"
+      功能类型:
+        value_type: "枚举"
+        description: "空调的功能类型（单冷/热泵/冷暖等）"
+
+  产品型号:
+    description: "代表一个具体的空调型号"
+    examples: ["美的观酷 KFR-35GW/N8XHC1", "格力T爽系列某型号"]
+    attributes:
+      型号编码:
+        value_type: "文本"
+        description: "产品的完整型号编码"
+      制冷量:
+        value_type: "数值"
+        unit: "W"
+        description: "产品的制冷能力"
+      制热量:
+        value_type: "数值"
+        unit: "W"
+        description: "产品的制热能力"
+      能效等级:
+        value_type: "枚举"
+        description: "能效等级（一级/二级/三级等）"
+      APF:
+        value_type: "数值"
+        description: "全年能源消耗效率"
+      噪音值:
+        value_type: "数值"
+        unit: "dB"
+        description: "运行时的噪音水平"
+      循环风量:
+        value_type: "数值"
+        unit: "m³/h"
+        description: "空气循环量"
+      额定功率:
+        value_type: "数值"
+        unit: "W"
+        description: "额定运行功率"
+      适用面积:
+        value_type: "数值"
+        unit: "㎡"
+        description: "适用的房间面积"
+
+  制造商:
+    description: "生产产品的公司或组织"
+    examples: ["格力", "美的", "海尔", "大金", "日立"]
+    attributes:
+      企业规模:
+        value_type: "文本"
+        description: "企业的规模描述"
+      生产基地:
+        value_type: "文本"
+        description: "主要生产基地位置"
+      技术实力:
+        value_type: "文本"
+        description: "企业的技术实力描述"
+      年营收:
+        value_type: "数值"
+        unit: "亿元"
+        description: "年度营业收入"
+      市场份额:
+        value_type: "数值"
+        unit: "%"
+        description: "市场占有率"
+
+  零部件:
+    description: "空调系统的关键零部件"
+    examples: ["压缩机", "换热器", "膨胀阀", "电控板", "风机"]
+    attributes:
+      部件型号:
+        value_type: "文本"
+        description: "零部件的型号编码"
+      技术参数:
+        value_type: "文本"
+        description: "零部件的技术参数描述"
+      供应商:
+        value_type: "文本"
+        description: "零部件的供应商名称"
+
+  技术:
+    description: "空调产品采用的技术、工艺或方法"
+    examples: ["变频技术", "热泵技术", "智能控制", "APF技术", "直流变频"]
+    attributes:
+      技术原理:
+        value_type: "文本"
+        description: "技术的基本原理说明"
+      技术优势:
+        value_type: "文本"
+        description: "技术的主要优势和特点"
+      应用场景:
+        value_type: "文本"
+        description: "技术的典型应用场景"
+
+  制冷剂:
+    description: "空调系统使用的制冷剂类型"
+    examples: ["R410A", "R32", "R290"]
+    attributes:
+      环保等级:
+        value_type: "文本"
+        description: "制冷剂的环保等级"
+      制冷效率:
+        value_type: "文本"
+        description: "制冷剂的制冷效率描述"
+      安全性:
+        value_type: "文本"
+        description: "制冷剂的安全性评估"
+      GWP值:
+        value_type: "数值"
+        description: "全球变暖潜能值"
+
+  能效等级:
+    description: "定义产品能效水平的国家或行业标准"
+    examples: ["一级能效", "二级能效", "三级能效", "新国标一级"]
+    attributes:
+      能效比:
+        value_type: "数值"
+        description: "能效比数值"
+      节能性能:
+        value_type: "文本"
+        description: "节能性能描述"
+
+  性能参数:
+    description: "某个空调的性能参数"
+    examples: ["制冷量", "制热量", "APF", "噪音值", "循环风量"]
+    attributes:
+      参数值:
+        value_type: "数值"
+        description: "参数的具体数值"
+      测试条件:
+        value_type: "文本"
+        description: "测试时的环境条件"
+      单位:
+        value_type: "文本"
+        description: "参数的计量单位"
+
+  产品功能:
+    description: "产品所具备的功能"
+    examples: ["变频控制", "自清洁", "智能控制", "快速制冷", "静音运行"]
+    attributes:
+      功能描述:
+        value_type: "文本"
+        description: "功能的详细描述"
+      实现方式:
+        value_type: "文本"
+        description: "功能的实现方式"
+
+  工程便利性:
+    description: "与实际工程安装、设备安装相关的关键点"
+    examples: ["铜铝优化连接", "最大配管长度", "安装便捷性"]
+    attributes:
+      安装要求:
+        value_type: "文本"
+        description: "安装的具体要求"
+      施工便利度:
+        value_type: "文本"
+        description: "施工的便利程度"
+
+  认证机构:
+    description: "提供产品认证的组织，如质量认证、性能认证等"
+    examples: ["CQC", "UL", "CE", "能效标识认证"]
+    attributes:
+      认证类型:
+        value_type: "文本"
+        description: "认证的类型（质量/性能/安全等）"
+      认证标准:
+        value_type: "文本"
+        description: "认证依据的标准"
+      认证范围:
+        value_type: "文本"
+        description: "认证覆盖的范围"
+
+  地区:
+    description: "地理位置、市场区域"
+    examples: ["中国", "上海", "海外市场", "东南亚", "欧洲"]
+
+  政策:
+    description: "政府政策、法规、标准"
+    examples: ["国补政策", "以旧换新", "能效标准", "碳中和政策"]
+
+  市场:
+    description: "市场、行业、领域"
+    examples: ["空调市场", "制冷市场", "家电行业", "中央空调市场"]
+
+  数值:
+    description: "数量、百分比、指标、参数值"
+    examples: ["15%", "156亿元", "5.2", "3500W", "35dB"]
+
+  时间:
+    description: "时间点、时间段"
+    examples: ["2025年", "上半年", "第一季度", "2024年"]
+
+# 关系类型定义 (支持灵活配置)
+relation_types:
+  属于品牌:
+    description: "产品型号或系列所属的品牌"
+    subject_types: ["产品型号", "系列"]
+    object_types: ["品牌"]
+    examples: ["美的观酷属于品牌美的", "格力T爽系列属于品牌格力"]
+
+  属于系列:
+    description: "产品型号归属于某个产品系列"
+    subject_types: ["产品型号"]
+    object_types: ["系列"]
+    examples: ["KFR-35GW/N8XHC1属于系列观酷"]
+
+  属于品类:
+    description: "产品归属于某个品类"
+    subject_types: ["产品型号", "系列"]
+    object_types: ["品类"]
+    examples: ["美的观酷属于品类壁挂式空调", "格力某型号属于品类单冷型"]
+
+  由...制造:
+    description: "产品由某制造商生产"
+    subject_types: ["产品型号", "系列", "零部件"]
+    object_types: ["制造商"]
+    examples: ["美的观酷由制造商美的制造", "某压缩机由格力制造"]
+
+  生产部件:
+    description: "制造商生产某零部件"
+    subject_types: ["制造商"]
+    object_types: ["零部件"]
+    examples: ["格力生产部件压缩机", "三花生产部件膨胀阀"]
+
+  使用部件:
+    description: "产品使用某零部件"
+    subject_types: ["产品型号"]
+    object_types: ["零部件"]
+    examples: ["美的观酷使用部件压缩机", "某型号使用部件电控板"]
+
+  采用技术:
+    description: "产品采用某技术"
+    subject_types: ["产品型号", "零部件"]
+    object_types: ["技术"]
+    examples: ["美的观酷采用技术变频技术", "压缩机采用技术直流变频"]
+
+  使用制冷剂:
+    description: "产品使用某制冷剂类型"
+    subject_types: ["产品型号"]
+    object_types: ["制冷剂"]
+    examples: ["美的观酷使用制冷剂R410A", "某型号使用制冷剂R32"]
+
+  符合能效:
+    description: "产品符合某能效等级"
+    subject_types: ["产品型号"]
+    object_types: ["能效等级"]
+    examples: ["美的观酷符合能效一级能效", "某型号符合能效新国标一级"]
+
+  具有参数:
+    description: "产品具有某性能参数"
+    subject_types: ["产品型号"]
+    object_types: ["性能参数"]
+    examples: ["美的观酷具有参数制冷量", "某型号具有参数APF"]
+
+  参数值为:
+    description: "性能参数的具体数值"
+    subject_types: ["性能参数"]
+    object_types: ["数值"]
+    examples: ["制冷量参数值为3500W", "APF参数值为5.2"]
+
+  具有功能:
+    description: "产品具有某功能特性"
+    subject_types: ["产品型号"]
+    object_types: ["产品功能"]
+    examples: ["美的观酷具有功能自清洁", "某型号具有功能智能控制"]
+
+  获得认证:
+    description: "产品获得某认证机构的认证"
+    subject_types: ["产品型号", "制造商"]
+    object_types: ["认证机构"]
+    examples: ["美的观酷获得认证CQC", "格力获得认证UL"]
+
+  具有工程便利性:
+    description: "产品在工程安装方面的便利性特点"
+    subject_types: ["产品型号"]
+    object_types: ["工程便利性"]
+    examples: ["某型号具有工程便利性铜铝优化连接"]
+
+  # 保留原有的通用关系
+  制造:
+    description: "主体生产、制造客体"
+    subject_types: ["制造商"]
+    object_types: ["产品型号", "零部件"]
+    examples: ["格力制造空调", "海立制造压缩机"]
+
+  供应:
+    description: "主体向客体供应产品或服务"
+    subject_types: ["制造商"]
+    object_types: ["制造商", "零部件"]
+    examples: ["三花供应零部件给格力"]
+
+  竞争:
+    description: "主体与客体存在竞争关系"
+    subject_types: ["制造商", "品牌"]
+    object_types: ["制造商", "品牌"]
+    examples: ["格力与美的竞争"]
+
+  合作:
+    description: "主体与客体存在合作关系"
+    subject_types: ["制造商", "品牌"]
+    object_types: ["制造商", "品牌"]
+    examples: ["美的与东芝合作"]
+
+  拥有:
+    description: "主体拥有、持有客体"
+    subject_types: ["制造商", "品牌"]
+    object_types: ["技术", "系列", "市场"]
+    examples: ["格力拥有变频技术", "美的拥有风尊系列"]
+
+  位于:
+    description: "主体位于某个地理位置"
+    subject_types: ["制造商", "市场"]
+    object_types: ["地区"]
+    examples: ["格力位于珠海", "中央空调市场位于中国"]
+
+  应用于:
+    description: "主体应用到客体中"
+    subject_types: ["技术"]
+    object_types: ["产品型号", "零部件"]
+    examples: ["变频技术应用于空调", "APF技术应用于某型号"]
+
+  影响:
+    description: "主体对客体产生影响"
+    subject_types: ["政策", "技术", "制造商"]
+    object_types: ["市场", "制造商", "产品型号"]
+    examples: ["国补政策影响空调市场"]
+
+  增长:
+    description: "主体出现增长趋势"
+    subject_types: ["市场", "制造商", "品牌"]
+    object_types: ["数值"]
+    examples: ["销量增长15%", "市场增长率提升"]
+
+  下降:
+    description: "主体出现下降趋势"
+    subject_types: ["市场", "制造商", "品牌"]
+    object_types: ["数值"]
+    examples: ["市场份额下降10%"]
+
+  收购:
+    description: "主体收购客体"
+    subject_types: ["制造商"]
+    object_types: ["制造商", "品牌"]
+    examples: ["美的收购东芝家电"]
+
+  投资:
+    description: "主体投资客体"
+    subject_types: ["制造商"]
+    object_types: ["制造商", "技术", "市场"]
+    examples: ["格力投资芯片技术"]
+
+  研发:
+    description: "主体研发客体"
+    subject_types: ["制造商"]
+    object_types: ["技术", "产品型号"]
+    examples: ["美的研发智能控制技术"]
+
+  出口:
+    description: "主体出口到客体"
+    subject_types: ["产品型号", "制造商"]
+    object_types: ["地区"]
+    examples: ["空调出口到东南亚"]
+
+  实现:
+    description: "主体实现某种效果或指标"
+    subject_types: ["技术", "产品型号", "制造商"]
+    object_types: ["数值", "性能参数"]
+    examples: ["热泵技术实现能效比5.2", "某型号实现制冷量3500W"]
+
+# JSON Schema配置
+# 启用后将使用OpenAI Structured Outputs或GLM的JSON模式
+# 这会强制模型输出符合指定schema的JSON格式，提高输出质量
+json_schema:
+  # 是否启用JSON Schema模式
+  # 注意：并非所有模型都支持此功能
+  # - OpenAI: GPT-4o及以上版本支持
+  # - GLM: glm-4及以上版本支持
+  # - 其他兼容OpenAI的API: 视具体实现而定
+  # 如果模型不支持，请设置为false，系统会回退到普通模式
+  enabled: true
+  schema:
+    type: "object"
+    additionalProperties: false
+    properties:
+      triplets:
+        type: "array"
+        items:
+          type: "object"
+          additionalProperties: false
+          properties:
+            subject:
+              type: "string"
+              description: "主实体名称"
+            subject_type:
+              type: "string"
+              description: "主实体类型"
+            subject_attributes:
+              type: "object"
+              description: "主实体的属性键值对，key为属性名，value为属性值"
+              additionalProperties: true
+            relation:
+              type: "string"
+              description: "关系类型"
+            object:
+              type: "string"
+              description: "客实体名称"
+            object_type:
+              type: "string"
+              description: "客实体类型"
+            object_attributes:
+              type: "object"
+              description: "客实体的属性键值对，key为属性名，value为属性值"
+              additionalProperties: true
+            confidence:
+              type: "number"
+              description: "置信度，范围0-1"
+              minimum: 0
+              maximum: 1
+            evidence:
+              type: "string"
+              description: "支撑该三元组的原文片段"
+            evidence_spans:
+              type: "array"
+              description: "证据在原文中的位置区间"
+              items:
+                type: "object"
+                additionalProperties: false
+                properties:
+                  start:
+                    type: "integer"
+                    description: "证据片段在原文中的起始位置"
+                  end:
+                    type: "integer"
+                    description: "证据片段在原文中的结束位置"
+                  text:
+                    type: "string"
+                    description: "证据文本内容"
+                required: ["start", "end", "text"]
+          required:
+            [
+              "subject",
+              "subject_type",
+              "subject_attributes",
+              "relation",
+              "object",
+              "object_type",
+              "object_attributes",
+              "confidence",
+              "evidence",
+              "evidence_spans",
+            ]
+    required: ["triplets"]
+
+# 提示词配置
+prompts:
+  # 系统提示词
+  system_prompt: |
+    你是一个专业的知识图谱构建专家，专门从文本中抽取结构化的三元组信息。
+    请严格按照指定的实体类型和关系类型进行抽取，确保抽取结果的准确性和一致性。
+
+    **重要**: 你必须为每个证据片段标注在原文中的准确位置(字符偏移量)。
+
+  # 主要任务提示词
+  task_prompt: |
+    请从以下文本中抽取三元组，格式为：(主实体, 关系, 客实体)，并提取实体的属性信息。
+
+    **实体类型定义**：
+    {{entity_types_desc}}
+
+    **关系类型定义**：
+    {{relation_types_desc}}
+
+    **抽取要求**：
+    1. 只抽取明确存在于文本中的事实关系
+    2. 实体名称要标准化（如：格力电器 -> 格力）
+    3. 关系必须从预定义的关系类型中选择
+    4. **必须提取实体属性**：对于每个实体，提取其在原文中明确提到的属性值
+       - 属性名必须与实体类型定义中的attributes字段对应
+       - 属性值必须来自原文，不要推测
+       - 如果原文未提及某属性，则该属性不出现在输出中
+       - subject_attributes和object_attributes如果没有提取到任何属性，则为空对象 {{}}
+    5. 每个三元组必须有明确的文本依据
+    6. 避免抽取模糊或推测性的关系
+    7. **必须标注evidence_spans**: 对每个证据片段，找到其在原文中的准确位置（字符偏移量）
+
+    **输出格式** (严格遵循JSON Schema)：
+    ```json
+    {{
+      "triplets": [
+        {{
+          "subject": "主实体",
+          "subject_type": "实体类型",
+          "subject_attributes": {{
+            "属性名1": "属性值1",
+            "属性名2": 123
+          }},
+          "relation": "关系",
+          "object": "客实体",
+          "object_type": "实体类型",
+          "object_attributes": {{
+            "属性名1": "属性值1"
+          }},
+          "confidence": 0.95,
+          "evidence": "支撑该三元组的原文片段",
+          "evidence_spans": [
+            {{
+              "start": 0,
+              "end": 10,
+              "text": "原文片段"
+            }}
+          ]
+        }}
+      ]
+    }}
+    ```
+
+  # Few-shot示例提示词
+  few_shot_examples: |
+    **示例1：**
+    输入文本：美的观酷 KFR-35GW/N8XHC1是一款壁挂式空调，采用变频技术，制冷量为3500W，能效等级达到新国标一级。
+    输出：
+    ```json
+    {
+      "triplets": [
+        {
+          "subject": "美的观酷",
+          "subject_type": "系列",
+          "subject_attributes": {
+            "系列特色": "智能控制"
+          },
+          "relation": "属于品牌",
+          "object": "美的",
+          "object_type": "品牌",
+          "object_attributes": {},
+          "confidence": 0.95,
+          "evidence": "美的观酷",
+          "evidence_spans": [
+            {
+              "start": 0,
+              "end": 4,
+              "text": "美的观酷"
+            }
+          ]
+        },
+        {
+          "subject": "KFR-35GW/N8XHC1",
+          "subject_type": "产品型号",
+          "subject_attributes": {
+            "型号编码": "KFR-35GW/N8XHC1",
+            "制冷量": 3500,
+            "能效等级": "新国标一级"
+          },
+          "relation": "属于系列",
+          "object": "观酷",
+          "object_type": "系列",
+          "object_attributes": {},
+          "confidence": 0.95,
+          "evidence": "美的观酷 KFR-35GW/N8XHC1",
+          "evidence_spans": [
+            {
+              "start": 0,
+              "end": 23,
+              "text": "美的观酷 KFR-35GW/N8XHC1"
+            }
+          ]
+        },
+        {
+          "subject": "KFR-35GW/N8XHC1",
+          "subject_type": "产品型号",
+          "subject_attributes": {
+            "制冷量": 3500
+          },
+          "relation": "属于品类",
+          "object": "壁挂式空调",
+          "object_type": "品类",
+          "object_attributes": {
+            "安装方式": "壁挂"
+          },
+          "confidence": 0.9,
+          "evidence": "是一款壁挂式空调",
+          "evidence_spans": [
+            {
+              "start": 23,
+              "end": 32,
+              "text": "是一款壁挂式空调"
+            }
+          ]
+        },
+        {
+          "subject": "KFR-35GW/N8XHC1",
+          "subject_type": "产品型号",
+          "subject_attributes": {},
+          "relation": "采用技术",
+          "object": "变频技术",
+          "object_type": "技术",
+          "object_attributes": {
+            "技术优势": "节能高效"
+          },
+          "confidence": 0.9,
+          "evidence": "采用变频技术",
+          "evidence_spans": [
+            {
+              "start": 33,
+              "end": 39,
+              "text": "采用变频技术"
+            }
+          ]
+        },
+        {
+          "subject": "KFR-35GW/N8XHC1",
+          "subject_type": "产品型号",
+          "subject_attributes": {},
+          "relation": "具有参数",
+          "object": "制冷量",
+          "object_type": "性能参数",
+          "object_attributes": {
+            "参数值": 3500,
+            "单位": "W"
+          },
+          "confidence": 0.9,
+          "evidence": "制冷量为3500W",
+          "evidence_spans": [
+            {
+              "start": 41,
+              "end": 52,
+              "text": "制冷量为3500W"
+            }
+          ]
+        },
+        {
+          "subject": "制冷量",
+          "subject_type": "性能参数",
+          "subject_attributes": {
+            "单位": "W"
+          },
+          "relation": "参数值为",
+          "object": "3500W",
+          "object_type": "数值",
+          "object_attributes": {},
+          "confidence": 0.95,
+          "evidence": "制冷量为3500W",
+          "evidence_spans": [
+            {
+              "start": 41,
+              "end": 52,
+              "text": "制冷量为3500W"
+            }
+          ]
+        },
+        {
+          "subject": "KFR-35GW/N8XHC1",
+          "subject_type": "产品型号",
+          "subject_attributes": {
+            "能效等级": "新国标一级"
+          },
+          "relation": "符合能效",
+          "object": "新国标一级",
+          "object_type": "能效等级",
+          "object_attributes": {
+            "能效比": 5.2,
+            "节能性能": "优秀"
+          },
+          "confidence": 0.95,
+          "evidence": "能效等级达到新国标一级",
+          "evidence_spans": [
+            {
+              "start": 54,
+              "end": 68,
+              "text": "能效等级达到新国标一级"
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+    **示例2：**
+    输入文本：格力T爽系列空调使用R32制冷剂，由格力电器制造，获得了CQC认证。
+    输出：
+    ```json
+    {
+      "triplets": [
+        {
+          "subject": "格力T爽系列",
+          "subject_type": "系列",
+          "subject_attributes": {
+            "系列特色": "舒适送风"
+          },
+          "relation": "属于品牌",
+          "object": "格力",
+          "object_type": "品牌",
+          "object_attributes": {
+            "品牌影响力": "国内领先"
+          },
+          "confidence": 0.95,
+          "evidence": "格力T爽系列",
+          "evidence_spans": [
+            {
+              "start": 0,
+              "end": 7,
+              "text": "格力T爽系列"
+            }
+          ]
+        },
+        {
+          "subject": "格力T爽系列",
+          "subject_type": "系列",
+          "subject_attributes": {},
+          "relation": "使用制冷剂",
+          "object": "R32",
+          "object_type": "制冷剂",
+          "object_attributes": {
+            "环保等级": "高",
+            "GWP值": 675
+          },
+          "confidence": 0.95,
+          "evidence": "使用R32制冷剂",
+          "evidence_spans": [
+            {
+              "start": 10,
+              "end": 19,
+              "text": "使用R32制冷剂"
+            }
+          ]
+        },
+        {
+          "subject": "格力T爽系列",
+          "subject_type": "系列",
+          "subject_attributes": {},
+          "relation": "由...制造",
+          "object": "格力电器",
+          "object_type": "制造商",
+          "object_attributes": {
+            "企业规模": "大型",
+            "技术实力": "行业领先"
+          },
+          "confidence": 0.95,
+          "evidence": "由格力电器制造",
+          "evidence_spans": [
+            {
+              "start": 21,
+              "end": 29,
+              "text": "由格力电器制造"
+            }
+          ]
+        },
+        {
+          "subject": "格力T爽系列",
+          "subject_type": "系列",
+          "subject_attributes": {},
+          "relation": "获得认证",
+          "object": "CQC",
+          "object_type": "认证机构",
+          "object_attributes": {
+            "认证类型": "质量认证"
+          },
+          "confidence": 0.9,
+          "evidence": "获得了CQC认证",
+          "evidence_spans": [
+            {
+              "start": 31,
+              "end": 40,
+              "text": "获得了CQC认证"
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+# 高级技巧配置
+advanced_techniques:
+  # 是否启用few-shot
+  enable_few_shot: true
+  # few-shot示例数量
+  few_shot_count: 2
+
+  # 是否启用思维链(Chain of Thought)
+  enable_cot: false
+
+  # 是否启用自我一致性(Self-Consistency)
+  enable_self_consistency: false
+  consistency_count: 3
+
+  # 是否启用结果验证
+  enable_verification: true
+  verification_prompt: |
+    请验证上述抽取结果的准确性：
+    1. 实体是否在原文中明确提到？
+    2. 关系是否真实存在？
+    3. 实体和关系类型是否正确？
+
+# 输出配置
+output:
+  # 输出格式: json, jsonl, csv, neo4j
+  format: "json"
+  # 输出文件路径
+  output_path: "knowledge_graph.json"
+  # 是否保存中间结果
+  save_intermediate: true
+  # 是否去重
+  deduplicate: true
+  # 置信度阈值
+  confidence_threshold: 0.7
+
+# 处理配置
+processing:
+  # 批处理大小
+  batch_size: 10
+  # 文本最大长度(token)
+  max_text_length: 8000
+  # 重试次数
+  max_retries: 3
+  # 重试间隔(秒)
+  retry_delay: 1
+  # 是否启用并行处理
+  enable_parallel: True
+  # 并行进程数
+  max_workers: 10
+  # 自动分块配置
+  enable_chunking: True          # 是否启用自动分块
+  chunk_size: 6000               # 每块的最大token数
+  chunk_overlap: 500             # 块之间的重叠token数（用于保持上下文连续性）
+
+# Schema发现配置
+schema_discovery:
+  # 是否启用Schema发现功能
+  enabled: true
+  # 输出目录
+  output_dir: "data/output"
