@@ -91,23 +91,22 @@ temp/
 tmp/
 
 # ---------------------------
-# Ignore ALL YAML / JSON...
+# Ignore ALL YAML / JSON / Markdown
 *.yml
 *.yaml
 *.json
+*.md
 
-# ...but keep commonly-needed ones (按需保留/删除)
+# Common exceptions (uncomment/adjust as needed)
 !package.json
 !package-lock.json
 !pnpm-lock.yaml
 !yarn.lock
+# !README.md
+# !CHANGELOG.md
+# !docs/**/*.md
 
-# 你之前的敏感配置规则：忽略具体配置，但保留示例
-# 注意：因为上面已经全局忽略了 *.yaml，这里加一条“包括示例”的反选
+# Keep example config, still ignore the real one
 !**/config/config.yaml.example
 **/config/config.yaml
-
-# （如需保留其他特定 JSON/YAML，在下面继续用 ! 加回来）
-# !path/to/needed.json
-# !some/dir/config.yaml
 # ---------------------------
