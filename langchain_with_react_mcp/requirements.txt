@@ -1,0 +1,20 @@
+# ============================================
+# LangChain ReAct Agent with MCP
+# 只锁定核心包，其他依赖自动解析
+# 安装命令: pip install -r requirements.txt
+# ============================================
+
+# LangChain 核心（只锁定这些）
+langchain==0.3.11
+langchain-openai==0.3.9
+
+# MCP 适配器（如果镜像源没有，用官方源）
+# pip install langchain-mcp-adapters==0.1.9 mcp==1.20.0 -i https://pypi.org/simple
+langchain-mcp-adapters==0.1.9
+mcp==1.20.0
+
+# 基础工具
+PyYAML
+beautifulsoup4
+requests
+httpx
