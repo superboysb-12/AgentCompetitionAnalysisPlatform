@@ -97,6 +97,8 @@ tmp/
 *.json
 *.md
 *.DS_Store
+*.md
+
 
 # Common exceptions (uncomment/adjust as needed)
 !package.json
