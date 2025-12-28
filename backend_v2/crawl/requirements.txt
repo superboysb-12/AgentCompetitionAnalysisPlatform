@@ -1,0 +1,57 @@
+# ============================================
+# 智能爬虫系统依赖包
+# ============================================
+
+# Web 自动化和爬虫
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# 数据库和 ORM
+SQLAlchemy>=2.0.0
+pymysql>=1.1.0
+cryptography>=41.0.0  # pymysql 需要，用于加密连接
+
+# 配置管理
+pyyaml>=6.0
+
+# 实用工具
+python-dateutil>=2.8.0
+
+# 异步支持
+aiofiles>=23.0.0
+
+# ============================================
+# 可选依赖（根据需要安装）
+# ============================================
+
+# Redis 支持（RAG 索引分发）
+# redis>=5.0.0
+
+# 向量检索库
+# faiss-cpu>=1.7.4  # CPU 版本
+# faiss-gpu>=1.7.4  # GPU 版本（需要 CUDA）
+# annoy>=1.17.0
+
+# 文本向量化
+# sentence-transformers>=2.2.0
+# torch>=2.0.0
+
+# LLM SDK
+# openai>=1.0.0
+# anthropic>=0.7.0
+
+# Web 框架（RAG 服务）
+# fastapi>=0.109.0
+# uvicorn>=0.25.0
+# pydantic>=2.0.0
+
+# 任务调度
+# apscheduler>=3.10.0
+
+# 日志和监控
+# loguru>=0.7.0
+
+# 开发和测试
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0

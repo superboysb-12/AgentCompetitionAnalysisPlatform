@@ -96,6 +96,7 @@ tmp/
 *.yaml
 *.json
 *.md
+*.DS_Store
 
 # Common exceptions (uncomment/adjust as needed)
 !package.json
