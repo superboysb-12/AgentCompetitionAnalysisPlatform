@@ -6,7 +6,7 @@
 from typing import List, Dict, Any
 from pathlib import Path
 from datetime import datetime
-from core.types import CrawlResult
+from crawl.core.types import CrawlResult
 import json
 import logging
 

@@ -6,14 +6,14 @@
 
 from typing import List, Dict, Any
 from playwright.async_api import Page
-from core.browser import BrowserManager
-from core.discovery import ButtonDiscovery
-from core.strategies import ClickStrategyManager
-from core.extractor import ContentExtractor
-from core.detector import PageLoadDetector
-from core.storage import StorageFactory
-from core.types import CrawlResult, ButtonInfo, ClickStrategy, CrawlMode
-from config.manager import ConfigManager
+from crawl.core.browser import BrowserManager
+from crawl.core.discovery import ButtonDiscovery
+from crawl.core.strategies import ClickStrategyManager
+from crawl.core.extractor import ContentExtractor
+from crawl.core.detector import PageLoadDetector
+from crawl.core.storage import StorageFactory
+from crawl.core.types import CrawlResult, ButtonInfo, ClickStrategy, CrawlMode
+from crawl.config.manager import ConfigManager
 from datetime import datetime
 import asyncio
 import logging

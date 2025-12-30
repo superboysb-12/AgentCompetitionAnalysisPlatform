@@ -30,9 +30,9 @@ def _run_crawler_worker():
     worker.start()
 
 
-def _run_placeholder_worker():
+def _run_rag_worker():
     """
-    在子进程中运行 PlaceholderWorker
+    在子进程中运行 RAGWorker
     """
     # 配置子进程日志
     logging.basicConfig(
@@ -40,9 +40,9 @@ def _run_placeholder_worker():
         format='[%(levelname)s] %(name)s - %(message)s'
     )
 
-    from workers import PlaceholderWorker
+    from workers import RAGWorker
 
-    worker = PlaceholderWorker()
+    worker = RAGWorker()
     worker.start()
 
 
@@ -68,17 +68,36 @@ class LifespanManager:
         self.task_manager = TaskManager(self.redis_client)
         logger.info("Redis 客户端已初始化")
 
+        # 预加载 RAG 模型（可选，通过环境变量控制）
+        import os
+        preload_rag = os.getenv("PRELOAD_RAG_MODEL", "true").lower() == "true"
+
+        if preload_rag:
+            try:
+                logger.info("🚀 开始预加载 RAG 模型...")
+                from rag import RAGSingletonManager
+                from settings import EMBEDDING_CONFIG, CHROMA_CONFIG
+
+                # 预加载 Embedding 模型和向量数据库
+                RAGSingletonManager.get_embeddings(EMBEDDING_CONFIG)
+                RAGSingletonManager.get_vector_store(CHROMA_CONFIG)
+
+                logger.info("✓ RAG 模型预加载完成！")
+            except Exception as e:
+                logger.error(f"✗ RAG 模型预加载失败: {e}")
+                logger.warning("应用将继续启动，但首次调用 RAG 服务时会加载模型")
+
         # 启动子进程1: CrawlerWorker
         crawler_process = mp.Process(target=_run_crawler_worker, name="CrawlerWorker")
         crawler_process.start()
         self.processes.append(crawler_process)
         logger.info(f"子进程1 CrawlerWorker 已启动，PID: {crawler_process.pid}")
 
-        # 启动子进程2: PlaceholderWorker
-        placeholder_process = mp.Process(target=_run_placeholder_worker, name="PlaceholderWorker")
-        placeholder_process.start()
-        self.processes.append(placeholder_process)
-        logger.info(f"子进程2 PlaceholderWorker 已启动，PID: {placeholder_process.pid}")
+        # 启动子进程2: RAGWorker
+        rag_process = mp.Process(target=_run_rag_worker, name="RAGWorker")
+        rag_process.start()
+        self.processes.append(rag_process)
+        logger.info(f"子进程2 RAGWorker 已启动，PID: {rag_process.pid}")
 
         logger.info("========== 应用启动完成 ==========")
 

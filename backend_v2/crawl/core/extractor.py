@@ -5,7 +5,7 @@
 
 from typing import Dict, Any
 from playwright.async_api import Page
-from core.utils import resolve_url
+from crawl.core.utils import resolve_url
 import logging
 
 logger = logging.getLogger(__name__)

@@ -5,8 +5,8 @@
 
 from typing import Optional, Dict, Any
 from playwright.async_api import Page
-from core.types import ButtonInfo, ClickStrategy, CrawlResult
-from core.utils import resolve_url
+from crawl.core.types import ButtonInfo, ClickStrategy, CrawlResult
+from crawl.core.utils import resolve_url
 from abc import ABC, abstractmethod
 import asyncio
 import logging

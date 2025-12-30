@@ -11,6 +11,7 @@ from pathlib import Path
 # ============================================
 BASE_DIR = Path(__file__).resolve().parent
 CRAWL_DIR = BASE_DIR / "crawl"
+RAG_DIR = BASE_DIR / "rag"
 
 # ============================================
 # MySQL 数据库配置
@@ -59,28 +60,76 @@ CRAWLER_CONFIG = {
 }
 
 # ============================================
-# 向量索引配置
+# Embedding 模型配置
 # ============================================
-INDEX_CONFIG = {
-    "index_type": "faiss",  # faiss 或 annoy
-    "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    "dimension": 384,  # 向量维度
+# BGE M3 模型资源消耗说明：
+# - 模型大小：FP32约2.2GB，FP16约1.1GB
+# - 参数量：560M（5.6亿参数）
+# - 向量维度：1024维
+#
+# 显存占用估算（使用GPU时）：
+# - batch_size=32, max_length=512: ~2.4-3.1GB 显存（需要4GB+显卡）
+# - batch_size=8,  max_length=256: ~2.0GB 显存（适合4GB显卡，紧张）
+# - batch_size=4,  max_length=128: ~1.5GB 显存（适合2GB显卡）
+#
+# 设备选择建议：
+# - CPU: 稳定可靠，不占显存，速度较慢（5-10 docs/s），推荐用于离线索引构建
+# - CUDA: 速度快（30-50 docs/s），但需要足够显存，推荐用于在线实时检索
+#
+EMBEDDING_CONFIG = {
+    "model_name": os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),  # BGE M3模型
+    "model_cache_dir": str(BASE_DIR / "models" / "embeddings"),  # 模型缓存目录
+
+    # 设备配置（根据你的硬件选择）
+    "device": os.getenv("EMBEDDING_DEVICE", "cpu"),  # 运行设备：cpu 或 cuda
+
+    # CPU配置（推荐，稳定）
+    "batch_size": int(os.getenv("EMBEDDING_BATCH_SIZE", 32)),  # CPU推荐：16-32
+    "max_length": int(os.getenv("EMBEDDING_MAX_LENGTH", 512)),  # CPU推荐：512
+
+    # 4GB显卡GPU配置（如需使用，取消注释并注释掉上面的配置）
+    # "device": "cuda",
+    # "batch_size": 8,   # 4GB显卡推荐：4-8
+    # "max_length": 256,  # 4GB显卡推荐：256
+
+    # 其他配置
+    "normalize_embeddings": True,  # 是否归一化向量
+}
+
+# ============================================
+# Chroma 向量数据库配置
+# ============================================
+CHROMA_CONFIG = {
+    "persist_directory": str(BASE_DIR / "data" / "chroma"),  # 持久化存储目录
+    "collection_name": os.getenv("CHROMA_COLLECTION", "crawl_results"),  # 集合名称
+    "distance_metric": "cosine",  # 距离度量：cosine, l2, ip
+    "anonymized_telemetry": False,  # 禁用匿名遥测
 }
 
 # ============================================
 # RAG 服务配置
 # ============================================
 RAG_CONFIG = {
-    "port": int(os.getenv("RAG_PORT", 8000)),
-    "top_k": 5,  # 检索Top-K文档
-    "llm_provider": "openai",  # openai 或 anthropic
-    "llm_model": "gpt-4",
+    "top_k": int(os.getenv("RAG_TOP_K", 5)),  # 检索Top-K文档
+    "score_threshold": float(os.getenv("RAG_SCORE_THRESHOLD", 0.5)),  # 相似度阈值
+    "max_content_length": int(os.getenv("RAG_MAX_CONTENT_LENGTH", 2000)),  # 返回内容最大长度
+    "enable_rerank": False,  # 是否启用重排序
 }
+
+# ============================================
+# RAG 模型预加载配置
+# ============================================
+# 是否在应用启动时预加载 RAG 模型
+# - True（推荐）: 启动时加载模型，首次请求响应快，但启动时间长（1-3分钟）
+# - False: 首次请求时加载，启动快但首次请求慢
+PRELOAD_RAG_MODEL = os.getenv("PRELOAD_RAG_MODEL", "true").lower() == "true"
 
 # ============================================
 # 定时任务配置
 # ============================================
 SCHEDULER_CONFIG = {
-    "crawler_interval_hours": 24,  # 爬虫执行间隔（小时）
-    "index_interval_hours": 6,     # 索引更新间隔（小时）
+    "crawler_interval_hours": int(os.getenv("CRAWLER_INTERVAL_HOURS", 24)),  # 爬虫执行间隔（小时）
+    "rag_index_interval_hours": int(os.getenv("RAG_INDEX_INTERVAL_HOURS", 6)),  # RAG索引更新间隔（小时）
+    "rag_index_cron": os.getenv("RAG_INDEX_CRON", None),  # Cron表达式（优先级高于interval）
+    "timezone": os.getenv("SCHEDULER_TIMEZONE", "Asia/Shanghai"),  # 时区
 }

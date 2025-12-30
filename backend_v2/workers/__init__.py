@@ -5,6 +5,6 @@ Worker 模块
 
 from .base import BaseWorker
 from .crawler_worker import CrawlerWorker
-from .placeholder_worker import PlaceholderWorker
+from .rag_worker import RAGWorker
 
-__all__ = ['BaseWorker', 'CrawlerWorker', 'PlaceholderWorker']
+__all__ = ['BaseWorker', 'CrawlerWorker', 'RAGWorker']

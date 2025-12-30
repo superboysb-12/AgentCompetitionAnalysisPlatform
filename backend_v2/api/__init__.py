@@ -1,6 +1,6 @@
 """
 API 模块
-提供爬虫相关的 API 路由
+提供爬虫和 RAG 相关的 API 路由
 """
 
 from .schemas import (
@@ -10,11 +10,13 @@ from .schemas import (
     CrawlResultResponse
 )
 from .crawl import router as crawl_router
+from .rag import rag_router
 
 __all__ = [
     'TaskSubmitRequest',
     'TaskSubmitResponse',
     'TaskStatusResponse',
     'CrawlResultResponse',
-    'crawl_router'
+    'crawl_router',
+    'rag_router',
 ]

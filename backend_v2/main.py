@@ -7,7 +7,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from lifespan import lifespan
-from api import crawl_router
+from api import crawl_router, rag_router
 
 # 配置日志
 logging.basicConfig(
@@ -37,6 +37,7 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(crawl_router)
+app.include_router(rag_router)
 
 
 @app.get("/")
@@ -49,7 +50,8 @@ async def root():
         "endpoints": {
             "docs": "/docs",
             "redoc": "/redoc",
-            "crawl_api": "/api/crawl"
+            "crawl_api": "/api/crawl",
+            "rag_api": "/api/rag"
         }
     }
 

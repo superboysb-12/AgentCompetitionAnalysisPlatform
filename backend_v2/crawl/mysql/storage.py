@@ -5,7 +5,7 @@ MySQL 存储实现
 
 from typing import List, Dict, Any, Set
 from datetime import datetime
-from core.types import CrawlResult
+from crawl.core.types import CrawlResult
 from .models import CrawlResultModel, Base
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker, Session
