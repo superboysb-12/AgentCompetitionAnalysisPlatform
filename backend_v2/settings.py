@@ -133,3 +133,89 @@ SCHEDULER_CONFIG = {
     "rag_index_cron": os.getenv("RAG_INDEX_CRON", None),  # Cron表达式（优先级高于interval）
     "timezone": os.getenv("SCHEDULER_TIMEZONE", "Asia/Shanghai"),  # 时区
 }
+
+# ============================================
+# Relation extractor config
+# ============================================
+RELATION_EXTRACTOR_CONFIG = {
+    # OpenAI config
+    "api_key": os.getenv(
+        "OPENAI_API_KEY",
+        "sk-zk27dc5e6f2447c59111f33391ffa21ff6368b7feced45a0",
+    ),
+    "base_url": os.getenv("OPENAI_BASE_URL", "https://api.zhizengzeng.com/v1/"),
+    "model": os.getenv("RELATION_MODEL", "gpt-4.1-mini"),
+
+    # Concurrency control
+    "max_concurrent": int(os.getenv("MAX_CONCURRENT", 5)),
+    "timeout": int(os.getenv("REQUEST_TIMEOUT", 60)),
+
+    # Retry config
+    "max_retries": int(os.getenv("MAX_RETRIES", 3)),
+    "retry_delay": float(os.getenv("RETRY_DELAY", 1.0)),
+
+    # CSV handling
+    "ignored_types": ["image", "discarded_header", "discarded_footer"],
+
+    # Logging
+    "log_file": str(BASE_DIR / "logs" / "relation_extractor.log"),
+    "log_level": os.getenv("LOG_LEVEL", "INFO"),
+
+    # Prompts
+    "system_prompt": (
+        "你是一名产品信息抽取专家。请严格遵循以下规则："
+        "1) 文本可能包含多个产品；以 product_model（必要时结合 brand/series）区分产品，每个独立产品输出 results 数组中的一条，不得将不同产品信息合并。"
+        "   若表格存在多行型号，每一行型号都要独立输出一条 result；共享信息（brand/category/series/features/key_components 等）可复制到每条中，但性能参数仅限该型号所在行。"
+        "2) 仅提取原文中有明确证据的字段，无证据的字段填空字符串或空数组，禁止猜测、编造或填默认值。"
+        "3) 标准字段：brand, category, series, product_model, manufacturer, refrigerant, "
+        "energy_efficiency_grade, features[], key_components[]."
+        "4) 性能参数 performance_specs[] 仅允许使用配置中列出的参数名，且只有当原文同时出现该参数的数值和期望单位时才输出；"
+        "如果缺失单位或不匹配，跳过该条。每条包含：name（标准参数名）、value（原文数值文本，可含符号）、"
+        "unit（期望单位或空）、raw（原文片段）。不得将不同产品的性能参数混在同一条结果中。"
+        "5) fact_text 收集无法落位但可能有用的原文句子，避免重复已提取的信息。"
+        "6) evidence 列出支撑上述字段的原文片段。"
+        "7) 输出必须符合给定 JSON Schema，除规定字段外不得添加其它字段。"
+    ),
+
+    # 性能参数及期望单位（空字符串表示可无单位）
+    "performance_param_units": {
+        "电源额定相数": "",
+        "电源额定电压": "V",
+        "电源额定频率": "Hz",
+        "额定制冷量": "kW",
+        "额定制热量": "kW",
+        "额定制冷功率": "kW",
+        "额定制冷电流": "A",
+        "额定制热功率": "kW",
+        "额定制热电流": "A",
+        "最大运转电流": "A",
+        "最大运转功率": "kW",
+        "IPLvV": "",
+        "EER": "",
+        "COP": "",
+        "APF": "",
+        "框体尺寸(宽*高*深)": "mm",
+        "毛重": "kg",
+        "净重": "kg",
+        "外机风量": "m³/h",
+        "室外机制冷噪音值": "dB",
+        "室外机制热噪音值": "dB",
+        "室外机最小噪音值": "dB",
+        "室外机最大噪音值": "dB",
+        "高/低压最大允许压力": "MPa",
+        "冷媒充注量": "kg",
+        "润滑油充注量": "kg",
+        "润滑油种类": "",
+        "联机配比范围": "%",
+        "模块组合范围": "",
+        "最多联机台数": "台",
+        "制冷运行范围": "kW",
+        "制热运行范围": "kW",
+        "最大总配管长": "m",
+        "最大单管长": "m",
+        "内外机最大高差(外机在上)": "m",
+        "内外机最大高差(外机在下)": "m",
+        "内机间最大高差": "m",
+        "机外静压": "Pa",
+    },
+}
