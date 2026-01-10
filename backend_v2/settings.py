@@ -148,7 +148,7 @@ RELATION_EXTRACTOR_CONFIG = {
 
     # Concurrency control
     "max_concurrent": int(os.getenv("MAX_CONCURRENT", 5)),
-    "timeout": int(os.getenv("REQUEST_TIMEOUT", 60)),
+    "timeout": int(os.getenv("REQUEST_TIMEOUT", 3000)),  # 请求超时时间(秒),默认3分钟
 
     # Retry config
     "max_retries": int(os.getenv("MAX_RETRIES", 3)),
@@ -169,6 +169,29 @@ RELATION_EXTRACTOR_CONFIG = {
         "2) 仅提取原文中有明确证据的字段，无证据的字段填空字符串或空数组，禁止猜测、编造或填默认值。"
         "3) 标准字段：brand, category, series, product_model, manufacturer, refrigerant, "
         "energy_efficiency_grade, features[], key_components[]."
+        "\n"
+        "**特别注意 - brand 字段的判断规则（重要）**："
+        "\n"
+        "  - brand 字段应该是**公司/品牌名称**（如：美的、格力、大金、海尔、三菱等），不是产品型号的一部分。"
+        "\n"
+        "  - **不要将产品型号前缀当作品牌**：如果只看到 2-5 个大写字母的型号前缀（如 MDV、FXS、GMV、KFR 等），这些通常是产品型号的一部分，不是品牌名称。"
+        "\n"
+        "  - 判断 brand 的正确方法："
+        "\n"
+        "    a) 如果原文明确提到品牌名称（如：'美的'、'Midea'、'GREE 格力'、'大金工业'等），则提取该品牌名称"
+        "\n"
+        "    b) 如果 manufacturer 字段包含明确的品牌关键词（如：'广东美的暖通设备有限公司'、'珠海格力电器'等），可以从中提取品牌核心名称（如：'美的'、'格力'）"
+        "\n"
+        "    c) 如果原文只有产品型号（如：'MDV-D15Q4'、'FXS-20MVJU'）而没有明确的品牌信息，则 brand 字段应该**留空**"
+        "\n"
+        "  - 常见误判案例（务必避免）："
+        "\n"
+        "    ✗ 错误：product_model='MDV-D15Q4', brand='MDV'  （MDV 是型号前缀，不是品牌）"
+        "\n"
+        "    ✓ 正确：product_model='MDV-D15Q4', brand=''  （如果原文没有品牌信息）"
+        "\n"
+        "    ✓ 正确：product_model='MDV-D15Q4', brand='美的', manufacturer='广东美的暖通设备有限公司'"
+        "\n"
         "4) 性能参数 performance_specs[] 仅允许使用配置中列出的参数名，且只有当原文同时出现该参数的数值和期望单位时才输出；"
         "如果缺失单位或不匹配，跳过该条。每条包含：name（标准参数名）、value（原文数值文本，可含符号）、"
         "unit（期望单位或空）、raw（原文片段）。不得将不同产品的性能参数混在同一条结果中。"
@@ -218,4 +241,26 @@ RELATION_EXTRACTOR_CONFIG = {
         "内机间最大高差": "m",
         "机外静压": "Pa",
     },
+}
+
+# ============================================
+# 品牌推断配置 (Brand Inference Config)
+# ============================================
+BRAND_INFERENCE_CONFIG = {
+    # k-NN参数
+    "k": int(os.getenv("BRAND_INFERENCE_K", 5)),  # k近邻数
+    "high_confidence_threshold": float(os.getenv("BRAND_HIGH_CONFIDENCE_THRESHOLD", 0.75)),  # 高置信度阈值
+    "medium_confidence_threshold": float(os.getenv("BRAND_MEDIUM_CONFIDENCE_THRESHOLD", 0.6)),  # 中置信度阈值
+
+    # 性能优化
+    "use_optimization": os.getenv("BRAND_INFERENCE_OPTIMIZATION", "true").lower() == "true",  # 是否启用性能优化
+    "coarse_grouping": True,  # 粗分组（按manufacturer首字母、category等）
+    "quick_filter_threshold": float(os.getenv("BRAND_QUICK_FILTER_THRESHOLD", 0.3)),  # 快速过滤阈值
+
+    # 应用策略
+    "apply_threshold": os.getenv("BRAND_APPLY_THRESHOLD", "high"),  # 应用阈值: "high"(仅高), "medium"(高+中), "all"(全部)
+
+    # 输出
+    "save_inference_log": True,  # 是否保存推断日志
+    "inference_log_dir": str(BASE_DIR.parent / "KnowledgeFusion" / "output"),  # 推断日志目录
 }

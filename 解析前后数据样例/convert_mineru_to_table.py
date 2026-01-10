@@ -69,6 +69,7 @@ def process_sample(sample_path, output_dir):
 
         for page_info in data.get('pdf_info', []):
             page_idx = page_info.get('page_idx', 0)
+            page_label = f"{json_file.stem}_page_{page_idx}"
 
             for block in page_info.get('para_blocks', []):
                 block_type = block.get('type', '')
@@ -77,7 +78,7 @@ def process_sample(sample_path, output_dir):
                 result = {
                     'sample': sample_name,
                     'file': json_file.name,
-                    'page': page_idx,
+                    'page': page_label,
                     'type': block_type,
                     'bbox': str(bbox),
                     'content': '',
@@ -137,7 +138,7 @@ def process_sample(sample_path, output_dir):
                     result = {
                         'sample': sample_name,
                         'file': json_file.name,
-                        'page': page_idx,
+                        'page': page_label,
                         'type': f'discarded_{block_type}',
                         'bbox': str(block.get('bbox', [])),
                         'content': '',

@@ -1,0 +1,9 @@
+# 知识融合系统依赖
+# 兼容的版本组合
+
+langchain==0.3.0
+langchain-core==0.3.0
+langchain-openai==0.2.0
+
+# 其他依赖
+tqdm>=4.66.0
