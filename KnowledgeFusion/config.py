@@ -32,6 +32,16 @@ try:
         "use_llm_backup": True,  # LLM二次判断（对所有k-NN结果）
         "save_inference_log": True,
         "inference_log_dir": "output",
+        "use_vector_knn": BRAND_INF_CFG.get("use_vector_knn", False),
+        "vector_config": BRAND_INF_CFG.get(
+            "vector_config",
+            {
+                "model_name": "moka-ai/m3e-base",
+                "M": 32,
+                "ef_construction": 200,
+                "ef_search": 200,
+            },
+        ),
     }
 
 except ImportError as e:
@@ -54,6 +64,13 @@ except ImportError as e:
         "use_llm_backup": True,  # LLM二次判断（对所有k-NN结果）
         "save_inference_log": True,
         "inference_log_dir": "output",
+        "use_vector_knn": False,
+        "vector_config": {
+            "model_name": "moka-ai/m3e-base",
+            "M": 32,
+            "ef_construction": 200,
+            "ef_search": 200,
+        },
     }
 
 # 指代融合配置 ⭐ NEW

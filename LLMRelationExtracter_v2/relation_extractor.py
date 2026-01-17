@@ -5,8 +5,9 @@ Relation extractor - extract structured product relations from plain text.
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -87,6 +88,8 @@ class RelationExtractor:
         self.performance_units = RELATION_EXTRACTOR_CONFIG.get(
             "performance_param_units", {}
         )
+        self._unit_tokens = self._build_unit_tokens(self.performance_units)
+        self._phi_symbols = ("\u03a6", "\u03c6", "\u00d8", "\u00f8")
 
     def _setup_logging(self) -> logging.Logger:
         """Set up file logger and ensure log directory exists."""
@@ -199,6 +202,16 @@ class RelationExtractor:
         def as_list_str(values: Optional[List]) -> List[str]:
             return [as_str(v) for v in values or [] if as_str(v)]
 
+        features = as_list_str(item.get("features"))
+        components = as_list_str(item.get("key_components"))
+
+        features, feature_specs = self._extract_specs_from_lines(features)
+        components, component_specs = self._extract_specs_from_lines(components)
+
+        merged_specs = list(item.get("performance_specs") or [])
+        merged_specs.extend(feature_specs)
+        merged_specs.extend(component_specs)
+
         result: Dict[str, object] = {
             "brand": as_str(item.get("brand")),
             "category": as_str(item.get("category")),
@@ -207,11 +220,9 @@ class RelationExtractor:
             "manufacturer": as_str(item.get("manufacturer")),
             "refrigerant": as_str(item.get("refrigerant")),
             "energy_efficiency_grade": as_str(item.get("energy_efficiency_grade")),
-            "features": as_list_str(item.get("features")),
-            "key_components": as_list_str(item.get("key_components")),
-            "performance_specs": self._filter_performance_specs(
-                item.get("performance_specs") or []
-            ),
+            "features": features,
+            "key_components": components,
+            "performance_specs": self._filter_performance_specs(merged_specs),
             "fact_text": as_list_str(item.get("fact_text")),
             "evidence": as_list_str(item.get("evidence")),
         }
@@ -224,6 +235,7 @@ class RelationExtractor:
         """
 
         filtered: List[Dict] = []
+        seen = set()
         for spec in specs:
             name = str(spec.get("name") or "").strip()
             raw = str(spec.get("raw") or "").strip()
@@ -239,13 +251,158 @@ class RelationExtractor:
                 if expected_unit.lower() not in raw.lower():
                     continue
 
+            value = str(spec.get("value") or "").strip()
+            unit = unit or expected_unit
+            key = (name, value, unit, raw)
+            if key in seen:
+                continue
+            seen.add(key)
+
             filtered.append(
                 {
                     "name": name,
-                    "value": str(spec.get("value") or "").strip(),
-                    "unit": unit or expected_unit,
+                    "value": value,
+                    "unit": unit,
                     "raw": raw,
                 }
             )
 
         return filtered
+
+    def _build_unit_tokens(self, units_map: Dict[str, str]) -> List[str]:
+        tokens = {str(unit).strip() for unit in units_map.values() if unit}
+        tokens.update(
+            {
+                "mm",
+                "cm",
+                "m",
+                "m3/h",
+                "l/min",
+                "ml/min",
+                "kg",
+                "g",
+                "w",
+                "kw",
+                "a",
+                "v",
+                "hz",
+                "pa",
+                "kpa",
+                "mpa",
+                "%",
+                "db",
+                "db(a)",
+                "rpm",
+            }
+        )
+        return sorted({t for t in tokens if t}, key=len, reverse=True)
+
+    def _extract_specs_from_lines(
+        self, items: List[str]
+    ) -> Tuple[List[str], List[Dict[str, str]]]:
+        remaining: List[str] = []
+        specs: List[Dict[str, str]] = []
+        for item in items:
+            spec = self._parse_param_line(item)
+            if spec:
+                specs.append(spec)
+            else:
+                remaining.append(item)
+        return remaining, specs
+
+    def _parse_param_line(self, text: str) -> Optional[Dict[str, str]]:
+        if not text:
+            return None
+        if not re.search(r"\d", text):
+            return None
+
+        name_raw = ""
+        value_raw = ""
+
+        match = re.match(r"^\s*([^:=：]+?)\s*[:=：]\s*(.+)$", text)
+        if match:
+            name_raw = match.group(1).strip()
+            value_raw = match.group(2).strip()
+        else:
+            compact = self._split_compact_name_value(text)
+            if not compact:
+                return None
+            name_raw, value_raw = compact
+
+        if not name_raw or not value_raw:
+            return None
+
+        name, unit_from_name = self._extract_unit_from_name(name_raw)
+        value, unit_from_value = self._extract_unit_from_value(value_raw)
+        unit = unit_from_value or unit_from_name or ""
+
+        return {
+            "name": name or name_raw,
+            "value": value,
+            "unit": unit,
+            "raw": text.strip(),
+        }
+
+    def _split_compact_name_value(self, text: str) -> Optional[Tuple[str, str]]:
+        text = text.strip()
+        if not text:
+            return None
+
+        split_index = None
+        for index, char in enumerate(text):
+            if char.isdigit() or char in self._phi_symbols:
+                split_index = index
+                break
+
+        if split_index is None:
+            return None
+
+        name = text[:split_index].strip()
+        value = text[split_index:].strip()
+        if not name or not value:
+            return None
+
+        if not re.search(r"[A-Za-z\u4e00-\u9fff]", name):
+            return None
+
+        return name, value
+
+    def _extract_unit_from_name(self, name: str) -> Tuple[str, str]:
+        if not name:
+            return "", ""
+        unit = ""
+        name_clean = name
+        for match in re.finditer(r"\(([^()]*)\)", name):
+            part = match.group(1).strip()
+            part_normalized = part.replace("\u00b3", "3")
+            if part_normalized and self._looks_like_unit(part_normalized):
+                unit = part_normalized
+                name_clean = name_clean.replace(match.group(0), "").strip()
+                break
+
+        if not unit:
+            for token in self._unit_tokens:
+                if name_clean.lower().endswith(token.lower()):
+                    unit = token
+                    name_clean = name_clean[: -len(token)].strip()
+                    break
+
+        return name_clean, unit
+
+    def _extract_unit_from_value(self, value: str) -> Tuple[str, str]:
+        if not value:
+            return "", ""
+        value_clean = value.strip().replace("\u00b3", "3")
+        for token in self._unit_tokens:
+            pattern = rf"^\s*(.+?)\s*{re.escape(token)}\s*$"
+            match = re.match(pattern, value_clean, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip()
+            if candidate and re.match(r"^[0-9.\-~xX*/\s]+$", candidate):
+                return candidate, token
+        return value_clean, ""
+
+    def _looks_like_unit(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(token.lower() in lowered for token in self._unit_tokens)

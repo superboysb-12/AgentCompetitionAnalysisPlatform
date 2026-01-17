@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import re
 from collections import Counter
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
@@ -12,7 +13,44 @@ from typing import Dict, List, Optional, Tuple
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
+from levenshtein import levenshtein_similarity
 from utils import run_async, extract_json, UnionFind
+
+# 常见组织/公司后缀，用于规范化品牌名
+COMMON_SUFFIXES = [
+    "集团",
+    "公司",
+    "有限公司",
+    "股份有限公司",
+    "电器",
+    "工业",
+    "株式会社",
+    "株式會社",  # 兼容部分全角写法
+]
+
+# 保护的大品牌根名称（规范化后），避免与其他大品牌误合并
+PROTECTED_BRANDS = {
+    "美的",
+    "格力",
+    "海尔",
+    "大金",
+    "日立",
+    "东芝",
+    "三菱",
+    "三菱电机",
+    "三菱重工",
+    "松下",
+    "lg",
+    "panasonic",
+    "daikin",
+    "hitachi",
+    "toshiba",
+    "gree",
+    "carrier",
+    "trane",
+    "york",
+    "aux",
+}
 
 
 def extract_unique_brands_with_frequency(
@@ -42,6 +80,83 @@ def extract_unique_brands_with_frequency(
     return sorted_brands
 
 
+def normalize_brand_name(name: str) -> str:
+    """
+    规范化品牌名：小写、去掉常见组织后缀和非字母数字字符。
+    """
+    lowered = name.strip().lower()
+    for suffix in COMMON_SUFFIXES:
+        lowered = lowered.replace(suffix.lower(), "")
+    # 去掉非字母数字/下划线的符号
+    lowered = re.sub(r"[^\w]", "", lowered)
+    return lowered
+
+
+def is_protected_brand(norm_name: str) -> bool:
+    """判断规范化名称是否在保护名单内。"""
+    return norm_name in PROTECTED_BRANDS
+
+
+def should_consider_pair(
+    brand1: str,
+    brand2: str,
+    brand_freq_map: Dict[str, int],
+    min_overlap: int = 2,
+    min_ratio: float = 0.65,
+    short_len: int = 3,
+    low_freq: int = 3,
+    stricter_ratio: float = 0.72,
+    top_freq_cut: Optional[int] = None,
+) -> bool:
+    """
+    预筛选品牌对，过滤掉明显无关的组合，减少 LLM 调用。
+    """
+    b1 = normalize_brand_name(brand1)
+    b2 = normalize_brand_name(brand2)
+
+    if not b1 or not b2:
+        return False
+
+    freq1 = brand_freq_map.get(brand1, 0)
+    freq2 = brand_freq_map.get(brand2, 0)
+    min_freq = min(freq1, freq2)
+    max_freq = max(freq1, freq2)
+
+    # 频次都极低且不在高频 Top 内，跳过
+    if top_freq_cut is not None and max_freq < top_freq_cut and min_freq <= low_freq:
+        return False
+
+    # 完全一致或包含关系必须保留
+    if b1 == b2 or b1 in b2 or b2 in b1:
+        return True
+
+    # 长度差异过大且没有包含关系，跳过（降低低频噪声）
+    if abs(len(b1) - len(b2)) > 8 and len(b1) > 4 and len(b2) > 4:
+        return False
+
+    common_chars = set(b1) & set(b2)
+    if len(common_chars) >= min_overlap:
+        return True
+
+    ratio = levenshtein_similarity(b1, b2)
+    # 低频且首字符不同且相似度很低，直接跳过
+    if min_freq <= low_freq and b1[:1] != b2[:1] and ratio < 0.8:
+        return False
+    # 对低频品牌要求更高的相似度
+    if min_freq <= low_freq:
+        if ratio >= stricter_ratio:
+            return True
+    else:
+        if ratio >= min_ratio:
+            return True
+
+    # 对极短的品牌名，放宽条件以避免漏判
+    if min(len(b1), len(b2)) <= short_len and common_chars:
+        return True
+
+    return False
+
+
 def quick_rule_judge_alias(brand1: str, brand2: str, freq1: int, freq2: int) -> Optional[Dict]:
     """
     使用快速规则判断品牌是否为别名（避免调用LLM）
@@ -57,6 +172,8 @@ def quick_rule_judge_alias(brand1: str, brand2: str, freq1: int, freq2: int) -> 
     """
     b1 = brand1.strip().lower()
     b2 = brand2.strip().lower()
+    b1_clean = normalize_brand_name(brand1)
+    b2_clean = normalize_brand_name(brand2)
 
     # 规则1: 完全相同（忽略大小写）
     if b1 == b2:
@@ -85,18 +202,6 @@ def quick_rule_judge_alias(brand1: str, brand2: str, freq1: int, freq2: int) -> 
             }
 
     # 规则3: 简单的包含关系（去掉常见后缀）
-    suffixes = ['集团', '公司', '有限公司', '股份有限公司', '电器', '工业', '株式会社']
-    b1_clean = b1
-    b2_clean = b2
-    for suffix in suffixes:
-        b1_clean = b1_clean.replace(suffix, '')
-        b2_clean = b2_clean.replace(suffix, '')
-
-    # 去掉空格和特殊字符
-    import re
-    b1_clean = re.sub(r'[^\w]', '', b1_clean)
-    b2_clean = re.sub(r'[^\w]', '', b2_clean)
-
     # 如果清理后相同，则是别名
     if b1_clean and b2_clean and b1_clean == b2_clean:
         canonical = brand1 if freq1 >= freq2 else brand2
@@ -149,7 +254,10 @@ def quick_rule_judge_alias(brand1: str, brand2: str, freq1: int, freq2: int) -> 
 
 def build_brand_pairs(
     brands: List[Tuple[str, int]],
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    min_overlap: int = 2,
+    min_ratio: float = 0.65,
+    top_freq_cut: int = 20,
 ) -> List[Tuple[str, str]]:
     """
     生成所有品牌对（用于LLM判断）
@@ -162,12 +270,26 @@ def build_brand_pairs(
         品牌对列表 [(brand1, brand2), ...]
     """
     brand_names = [b[0] for b in brands]
-    pairs = list(combinations(brand_names, 2))
+    brand_freq_map = {name: freq for name, freq in brands}
+    all_pairs = combinations(brand_names, 2)
+
+    filtered_pairs = []
+    for b1, b2 in all_pairs:
+        if should_consider_pair(
+            b1,
+            b2,
+            brand_freq_map,
+            min_overlap=min_overlap,
+            min_ratio=min_ratio,
+            top_freq_cut=top_freq_cut,
+        ):
+            filtered_pairs.append((b1, b2))
 
     if logger:
-        logger.info(f"  生成 {len(pairs)} 个品牌对用于判断")
+        total = len(brand_names) * (len(brand_names) - 1) // 2
+        logger.info(f"  生成 {len(filtered_pairs)} 个品牌对用于判断 (原始 {total})")
 
-    return pairs
+    return filtered_pairs
 
 
 async def llm_judge_alias_async(
@@ -253,7 +375,8 @@ async def batch_llm_judge_aliases_async(
     brand_freq_map: Dict[str, int],
     llm: ChatOpenAI,
     prompt_template: ChatPromptTemplate,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    max_concurrent: Optional[int] = None,
 ) -> List[Dict]:
     """
     批量使用LLM判断品牌对是否为别名（异步并发）
@@ -269,13 +392,19 @@ async def batch_llm_judge_aliases_async(
         判断结果列表
     """
     # 创建所有异步任务，并使用列表保持顺序
+    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent and max_concurrent > 0 else None
     tasks_with_brands = []
+
+    async def run_one(b1: str, b2: str):
+        freq1 = brand_freq_map.get(b1, 0)
+        freq2 = brand_freq_map.get(b2, 0)
+        if semaphore:
+            async with semaphore:
+                return await llm_judge_alias_async(b1, b2, freq1, freq2, llm, prompt_template)
+        return await llm_judge_alias_async(b1, b2, freq1, freq2, llm, prompt_template)
+
     for brand1, brand2 in brand_pairs:
-        freq1 = brand_freq_map.get(brand1, 0)
-        freq2 = brand_freq_map.get(brand2, 0)
-        task = asyncio.create_task(
-            llm_judge_alias_async(brand1, brand2, freq1, freq2, llm, prompt_template)
-        )
+        task = asyncio.create_task(run_one(brand1, brand2))
         tasks_with_brands.append((task, brand1, brand2))
 
     # 使用asyncio.wait逐个处理完成的任务
@@ -343,18 +472,52 @@ def build_alias_map(
     # 初始化并查集
     uf = UnionFind(len(brand_list))
 
+    def valid_llm_alias(result: Dict) -> bool:
+        """严格校验LLM结果，避免错误合并。"""
+        if not result.get("is_alias"):
+            return False
+        method = result.get("method", "")
+        conf = result.get("confidence", 0.0) or 0.0
+        brand1 = result.get("brand1", "")
+        brand2 = result.get("brand2", "")
+
+        norm1 = normalize_brand_name(brand1)
+        norm2 = normalize_brand_name(brand2)
+        if not norm1 or not norm2:
+            return False
+
+        # 规则结果直接信任
+        if method.startswith("rule_"):
+            return True
+
+        # LLM结果要求高置信度且相似/包含
+        contains = norm1 in norm2 or norm2 in norm1
+        sim = levenshtein_similarity(norm1, norm2)
+        if conf < 0.8:
+            return False
+        if not contains and sim < 0.82:
+            return False
+
+        # 保护大品牌：大品牌之间如不同根且不高度相似则拒绝
+        if is_protected_brand(norm1) and is_protected_brand(norm2):
+            if norm1 != norm2 and not contains and sim < 0.9:
+                return False
+        return True
+
     # 根据LLM判断结果合并
     merge_count = 0
     for result in llm_results:
-        if result.get('is_alias') and result.get('confidence', 0) > 0.6:
-            brand1 = result['brand1']
-            brand2 = result['brand2']
+        if not valid_llm_alias(result):
+            continue
 
-            if brand1 in brand_to_idx and brand2 in brand_to_idx:
-                idx1 = brand_to_idx[brand1]
-                idx2 = brand_to_idx[brand2]
-                uf.union(idx1, idx2)
-                merge_count += 1
+        brand1 = result["brand1"]
+        brand2 = result["brand2"]
+
+        if brand1 in brand_to_idx and brand2 in brand_to_idx:
+            idx1 = brand_to_idx[brand1]
+            idx2 = brand_to_idx[brand2]
+            uf.union(idx1, idx2)
+            merge_count += 1
 
     if logger:
         logger.info(f"  LLM判断合并了 {merge_count} 对品牌")
@@ -615,14 +778,22 @@ def perform_alias_fusion(
             base_url=llm_config.get('base_url'),
             model=llm_config.get('model', 'gpt-4o-mini'),
             temperature=0.1,
-            timeout=llm_config.get('timeout', 300)
+            timeout=min(llm_config.get('timeout', 300), 120),  # 收紧超时让进度推进
         )
 
         prompt_template = create_alias_fusion_prompt_template()
 
-        # 异步批量判断
+        # 异步批量判断，限制并发
+        max_concurrent = llm_config.get("alias_max_concurrent") or llm_config.get("max_concurrent") or 100
         llm_results = run_async(
-            batch_llm_judge_aliases_async(need_llm_pairs, brand_freq_map, llm, prompt_template, logger)
+            batch_llm_judge_aliases_async(
+                need_llm_pairs,
+                brand_freq_map,
+                llm,
+                prompt_template,
+                logger,
+                max_concurrent=max_concurrent,
+            )
         )
 
     # 合并规则和LLM结果

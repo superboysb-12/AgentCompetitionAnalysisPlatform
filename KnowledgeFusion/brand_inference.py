@@ -8,14 +8,29 @@
 import asyncio
 import logging
 from collections import defaultdict, Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from tqdm import tqdm
 
 from levenshtein import calculate_entity_similarity
 from utils import run_async, extract_json
+
+try:  # 可选依赖：向量召回
+    import hnswlib
+    HNSW_AVAILABLE = True
+except ImportError:  # pragma: no cover - 可选依赖
+    HNSW_AVAILABLE = False
+
+try:  # 可选依赖：句向量模型
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:  # pragma: no cover - 可选依赖
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 
 # ==================== 性能优化函数 ====================
@@ -35,6 +50,109 @@ def compute_fingerprint(entity: Dict) -> Dict:
         'manufacturer_first_char': entity.get('manufacturer', '')[:1].lower(),
         'category': entity.get('category', ''),
     }
+
+# ==================== 向量化/召回 ====================
+
+
+def format_entity_text(entity: Dict) -> str:
+    """将实体关键字段拼接为用于编码的文本。"""
+    parts = []
+    for key in ("brand", "product_model", "manufacturer", "series", "category"):
+        val = str(entity.get(key, "")).strip()
+        if val:
+            parts.append(val)
+    return " | ".join(parts)
+
+
+def get_embedder(model_name: str = "moka-ai/m3e-base", device: Optional[str] = None) -> Optional[Callable[[List[str]], np.ndarray]]:
+    """
+    获取句向量编码器，优先GPU。
+    返回一个函数 encode(texts) -> np.ndarray
+    """
+    if not SENTENCE_TRANSFORMERS_AVAILABLE:
+        return None
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SentenceTransformer(model_name, device=device)
+
+    def encode(texts: List[str]) -> np.ndarray:
+        return model.encode(
+            texts,
+            batch_size=32,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+
+    return encode
+
+
+def build_hnsw_index(
+    entities_with_brand: List[Dict],
+    embed: Callable[[List[str]], np.ndarray],
+    space: str = "cosine",
+    M: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 200,
+    logger: Optional[logging.Logger] = None,
+):
+    """
+    构建 HNSW 索引（CPU），返回 index, id->entity 映射。
+    """
+    texts = [format_entity_text(e) for e in entities_with_brand]
+    embeddings = embed(texts)
+    dim = embeddings.shape[1]
+
+    index = hnswlib.Index(space=space, dim=dim)
+    index.init_index(max_elements=len(embeddings), ef_construction=ef_construction, M=M)
+    index.add_items(embeddings, np.arange(len(embeddings)))
+    index.set_ef(ef_search)
+
+    if logger:
+        logger.info(f"  HNSW 索引构建完成: dim={dim}, elements={len(embeddings)}, ef_search={ef_search}")
+
+    id_to_entity = {i: e for i, e in enumerate(entities_with_brand)}
+    return index, id_to_entity
+
+
+def infer_brand_vector(
+    entity_without_brand: Dict,
+    index,
+    id_to_entity: Dict[int, Dict],
+    embed: Callable[[List[str]], np.ndarray],
+    k: int,
+) -> Tuple[Optional[str], float, List[Dict]]:
+    """
+    使用向量召回 + 相似度聚合推断品牌。
+    """
+    query_text = format_entity_text(entity_without_brand)
+    if not query_text:
+        return None, 0.0, []
+
+    query_emb = embed([query_text])
+    labels, distances = index.knn_query(query_emb, k=k)
+    neighbors = []
+    for lbl, dist in zip(labels[0], distances[0]):
+        sim = 1 - dist  # cosine 距离 -> 相似度
+        ent = id_to_entity.get(lbl)
+        if ent:
+            neighbors.append({"entity": ent, "score": float(sim), "brand": ent.get("brand", "")})
+
+    brand_scores = defaultdict(float)
+    for item in neighbors:
+        brand_scores[item["brand"]] += item["score"] ** 2
+
+    if not brand_scores:
+        return None, 0.0, neighbors[:3]
+
+    best_brand = max(brand_scores.items(), key=lambda x: x[1])
+    total_weight = sum(brand_scores.values())
+    confidence = best_brand[1] / total_weight if total_weight > 0 else 0.0
+
+    return best_brand[0], confidence, neighbors[:3]
+
 
 
 def coarse_group_key(entity: Dict) -> str:
@@ -259,10 +377,12 @@ def batch_infer_brands_knn(
     entities_with_brand: List[Dict],
     k: int,
     use_optimization: bool = True,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    use_vector_knn: bool = False,
+    vector_config: Optional[Dict] = None,
 ) -> List[Dict]:
     """
-    批量k-NN品牌推断
+    批量品牌推断：优先使用向量召回（句向量 + HNSW/暴力相似度），否则回退旧 k-NN
 
     Args:
         entities_without_brand: 无品牌实体列表
@@ -276,31 +396,99 @@ def batch_infer_brands_knn(
     """
     results = []
 
-    # 构建粗分组索引
+    # ==== 1) 向量召回路径 ====
+    vector_enabled = use_vector_knn and SENTENCE_TRANSFORMERS_AVAILABLE
+    embed_fn = None
+    index = None
+    id_to_entity = None
+    emb_matrix = None
+
+    if vector_enabled:
+        vector_config = vector_config or {}
+        model_name = vector_config.get("model_name", "moka-ai/m3e-base")
+        M = vector_config.get("M", 32)
+        ef_construction = vector_config.get("ef_construction", 200)
+        ef_search = vector_config.get("ef_search", 200)
+        embed_fn = get_embedder(model_name=model_name)
+        if embed_fn is None:
+            vector_enabled = False
+            if logger:
+                logger.warning("  向量召回未启用：无法加载句向量模型")
+        else:
+            texts = [format_entity_text(e) for e in entities_with_brand]
+            if HNSW_AVAILABLE:
+                if logger:
+                    logger.info(f"  使用向量召回 (HNSW, model={model_name}, M={M}, ef_search={ef_search})")
+                index, id_to_entity = build_hnsw_index(
+                    entities_with_brand,
+                    embed_fn,
+                    M=M,
+                    ef_construction=ef_construction,
+                    ef_search=ef_search,
+                    logger=logger,
+                )
+            else:
+                # 暴力相似度（dot-product），仍可利用GPU编码加速
+                if logger:
+                    logger.info(f"  使用向量召回 (暴力相似度, model={model_name})")
+                emb_matrix = embed_fn(texts)
+
+    # ==== 2) 旧 k-NN 路径（回退） ====
     coarse_index = None
-    if use_optimization:
+    if not vector_enabled and use_optimization:
         coarse_index = build_coarse_group_index(entities_with_brand)
         if logger:
             logger.info(f"  构建粗分组索引: {len(coarse_index)} 个组")
 
-    # 批量推断
+    # ==== 3) 批量推断 ====
     for entity in tqdm(entities_without_brand, desc="k-NN品牌推断"):
-        inferred_brand, confidence, neighbors = infer_brand_for_entity(
-            entity,
-            entities_with_brand,
-            k,
-            coarse_index,
-            use_optimization
-        )
+        if vector_enabled and embed_fn is not None:
+            if index is not None and id_to_entity is not None:
+                inferred_brand, confidence, neighbors = infer_brand_vector(
+                    entity, index, id_to_entity, embed_fn, k
+                )
+            else:
+                # 暴力相似度
+                query_text = format_entity_text(entity)
+                if not query_text or emb_matrix is None:
+                    inferred_brand, confidence, neighbors = None, 0.0, []
+                else:
+                    q_emb = embed_fn([query_text])[0]
+                    sims = emb_matrix @ q_emb  # 已归一化
+                    topk_idx = np.argpartition(-sims, kth=min(k, len(sims) - 1))[:k]
+                    topk_idx = topk_idx[np.argsort(-sims[topk_idx])]
+                    neighbors = []
+                    brand_scores = defaultdict(float)
+                    for idx in topk_idx:
+                        ent = entities_with_brand[int(idx)]
+                        sim = float(sims[int(idx)])
+                        neighbors.append({"entity": ent, "score": sim, "brand": ent.get("brand", "")})
+                        brand_scores[ent.get("brand", "")] += sim ** 2
+                    if brand_scores:
+                        best_brand = max(brand_scores.items(), key=lambda x: x[1])
+                        total_weight = sum(brand_scores.values())
+                        confidence = best_brand[1] / total_weight if total_weight > 0 else 0.0
+                        inferred_brand = best_brand[0]
+                    else:
+                        inferred_brand, confidence = None, 0.0
+        else:
+            inferred_brand, confidence, neighbors = infer_brand_for_entity(
+                entity,
+                entities_with_brand,
+                k,
+                coarse_index,
+                use_optimization,
+            )
 
-        result = {
-            'entity': entity,
-            'inferred_brand': inferred_brand,
-            'confidence': confidence,
-            'neighbors': neighbors,
-            'inference_method': 'knn'
-        }
-        results.append(result)
+        results.append(
+            {
+                "entity": entity,
+                "inferred_brand": inferred_brand,
+                "confidence": confidence,
+                "neighbors": neighbors,
+                "inference_method": "vector_knn" if vector_enabled else "knn",
+            }
+        )
 
     return results
 
@@ -523,7 +711,8 @@ async def batch_llm_infer_brands_async(
     known_brands: List[str],
     llm: ChatOpenAI,
     representative_entities: Optional[Dict[str, List[Dict]]] = None,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    max_concurrent: Optional[int] = None
 ) -> List[Dict]:
     """
     批量使用LLM推断品牌（异步并发）
@@ -538,18 +727,31 @@ async def batch_llm_infer_brands_async(
     Returns:
         LLM推断结果列表
     """
-    tasks = []
-    for result in results:
-        task = asyncio.create_task(
-            llm_infer_brand_async(
-                result['entity'],
-                result['neighbors'],
-                known_brands,
-                llm,
-                representative_entities
-            )
+    semaphore = (
+        asyncio.Semaphore(max_concurrent)
+        if max_concurrent and max_concurrent > 0
+        else None
+    )
+
+    async def run_one(result: Dict) -> Dict:
+        if semaphore:
+            async with semaphore:
+                return await llm_infer_brand_async(
+                    result['entity'],
+                    result['neighbors'],
+                    known_brands,
+                    llm,
+                    representative_entities
+                )
+        return await llm_infer_brand_async(
+            result['entity'],
+            result['neighbors'],
+            known_brands,
+            llm,
+            representative_entities
         )
-        tasks.append(task)
+
+    tasks = [asyncio.create_task(run_one(result)) for result in results]
 
     # 并发执行
     llm_results = []
@@ -614,6 +816,8 @@ def perform_brand_inference(
     medium_threshold = inference_config.get('medium_confidence_threshold', 0.6)
     use_optimization = inference_config.get('use_optimization', True)
     use_llm_backup = inference_config.get('use_llm_backup', True)
+    use_vector_knn = inference_config.get('use_vector_knn', False)
+    vector_config = inference_config.get('vector_config', {})
 
     # 步骤1: 分离实体
     if logger:
@@ -652,7 +856,9 @@ def perform_brand_inference(
         entities_with_brand,
         k,
         use_optimization,
-        logger
+        logger,
+        use_vector_knn=use_vector_knn,
+        vector_config=vector_config,
     )
 
     # 步骤3: LLM辅助推断（所有k-NN结果）
@@ -674,13 +880,15 @@ def perform_brand_inference(
         known_brands = list(set(e.get('brand', '') for e in entities_with_brand))
 
         # 异步批量LLM推断（传递代表性实体）
+        max_concurrent = inference_config.get('max_concurrent', 30)
         llm_results = run_async(
             batch_llm_infer_brands_async(
                 knn_results,  # 所有结果
                 known_brands,
                 llm,
                 representative_entities,
-                logger
+                logger,
+                max_concurrent
             )
         )
 

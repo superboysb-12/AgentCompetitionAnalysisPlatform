@@ -113,3 +113,10 @@ tmp/
 !**/config/config.yaml.example
 **/config/config.yaml
 # ---------------------------
+
+*.json
+*.jsonl
+*.csv
+*.png
+*.pdf
+*.zip

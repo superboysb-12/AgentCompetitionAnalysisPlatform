@@ -264,3 +264,36 @@ BRAND_INFERENCE_CONFIG = {
     "save_inference_log": True,  # 是否保存推断日志
     "inference_log_dir": str(BASE_DIR.parent / "KnowledgeFusion" / "output"),  # 推断日志目录
 }
+
+# ============================================
+# Graph importer config
+# ============================================
+GRAPH_IMPORTER_CONFIG = {
+    "json_path": str(BASE_DIR.parent / "results" / "fused_entities_all.json"),
+    "json_encoding": os.getenv("GRAPH_IMPORTER_JSON_ENCODING", "utf-8"),
+    "dry_run": os.getenv("GRAPH_IMPORTER_DRY_RUN", "false").lower() == "true",
+    "create_constraints": os.getenv("GRAPH_IMPORTER_CREATE_CONSTRAINTS", "true").lower() == "true",
+    "clear_before_import": os.getenv("GRAPH_IMPORTER_CLEAR_BEFORE_IMPORT", "false").lower() == "true",
+    "batch_size": int(os.getenv("GRAPH_IMPORTER_BATCH_SIZE", "500")),
+    "neo4j": {
+        "uri": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        "user": os.getenv("NEO4J_USER", "neo4j"),
+        "password": os.getenv("NEO4J_PASSWORD", "12345678"),
+        "database": os.getenv("NEO4J_DATABASE", "neo4j"),
+    },
+    "schema": {
+        "labels": {
+            "product": "Product",
+            "brand": "Brand",
+            "manufacturer": "Manufacturer",
+            "category": "Category",
+            "series": "Series",
+        },
+        "relationships": {
+            "brand": "BRANDED_BY",
+            "manufacturer": "MANUFACTURED_BY",
+            "category": "IN_CATEGORY",
+            "series": "IN_SERIES",
+        },
+    },
+}
