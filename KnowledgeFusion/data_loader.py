@@ -263,7 +263,7 @@ if __name__ == "__main__":
     logger = get_logger()
 
     # 这里需要实际的测试数据文件
-    test_file = "../LLMRelationExtracter_v2/relation_results.json"
+    test_file = "../LLMRelationExtracter/relation_results.json"
 
     if Path(test_file).exists():
         entities, original_data = load_and_prepare_data(test_file, logger)
