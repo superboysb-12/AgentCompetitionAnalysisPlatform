@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
-from backend_v2.settings import RELATION_EXTRACTOR_CONFIG
+from backend.settings import RELATION_EXTRACTOR_CONFIG
 
 # JSON schema for strict response validation (simplified, aligns with target table)
 RELATION_SCHEMA = {
@@ -141,9 +141,14 @@ class RelationExtractor:
                             {
                                 "role": "user",
                                 "content": (
-                                    "Extract product relations from the text. "
-                                    "If multiple product models are present (e.g., table rows), output one result per model; "
-                                    "do NOT merge specs across models.\n\n"
+                                    "Extract product relations from the text below. "
+                                    "IMPORTANT INSTRUCTIONS:\n"
+                                    "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
+                                    "- Use context from other pages only to complete information for products on the current page\n"
+                                    "- If a table spans multiple pages, merge the information for products on the current page\n"
+                                    "- If multiple product models are present (e.g., table rows), output one result per model\n"
+                                    "- Do NOT merge specs across different models\n"
+                                    "- Do NOT extract products that only appear in context pages\n\n"
                                     f"{text}"
                                 ),
                             },

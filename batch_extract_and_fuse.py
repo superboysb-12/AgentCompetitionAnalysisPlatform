@@ -14,11 +14,21 @@ KNOWLEDGE_FUSION_DIR = ROOT_DIR / "KnowledgeFusion"
 sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(KNOWLEDGE_FUSION_DIR))
 
-from backend_v2.settings import RELATION_EXTRACTOR_CONFIG  # noqa: E402
-from LLMRelationExtracter_v2 import load_pages_from_csv  # noqa: E402
-from LLMRelationExtracter_v2.relation_extractor import (  # noqa: E402
+from backend.settings import RELATION_EXTRACTOR_CONFIG  # noqa: E402
+from LLMRelationExtracter import (  # noqa: E402
+    correct_all_categories,
+    deduplicate_results,
+    extract_frequent_models,
+    filter_empty_products,
+    load_pages_with_context,
+)
+from LLMRelationExtracter.relation_extractor import (  # noqa: E402
     RELATION_SCHEMA,
     RelationExtractor,
+)
+from LLMRelationExtracter_v2 import (  # noqa: E402
+    extract_relations_multistage,
+    load_pages_with_context_v2,
 )
 from langchain_core.prompts import ChatPromptTemplate  # noqa: E402
 from langchain_openai import ChatOpenAI  # noqa: E402
@@ -147,11 +157,30 @@ def extract_relations_for_csv(
     output_path: Path,
     error_log_path: Path,
     max_concurrent: int,
+    use_sliding_window: bool = True,
+    window_size: int = 1,
 ) -> None:
     logger = setup_relation_logger()
     start_time = time.time()
     logger.info("Relation extraction start: %s", csv_path)
-    pages = list(load_pages_from_csv(str(csv_path)))
+
+    # Extract frequent models for context
+    known_models = None
+    if use_sliding_window:
+        logger.info("Extracting frequent product models...")
+        known_models = extract_frequent_models(str(csv_path), min_frequency=3)
+        logger.info("Found %d frequent models", len(known_models))
+
+    # Load pages with or without context window
+    if use_sliding_window:
+        pages = list(load_pages_with_context(
+            str(csv_path),
+            window_size=window_size,
+            known_models=known_models,
+        ))
+    else:
+        pages = list(load_pages_with_context(str(csv_path), window_size=0, known_models=None))
+
     if not pages:
         logger.warning("No pages found for %s", csv_path)
         output_path.write_text("[]", encoding="utf-8")
@@ -218,6 +247,54 @@ def extract_relations_for_csv(
         return completed
 
     completed = asyncio.run(run())
+
+    # Deduplicate results if using sliding window
+    if use_sliding_window:
+        logger.info("Deduplicating results...")
+        original_count = sum(len(r.get("results", [])) for r in completed)
+        deduplicated = deduplicate_results(completed)
+        logger.info(
+            "Deduplicated: %d -> %d products",
+            original_count,
+            len(deduplicated),
+        )
+
+        # Correct categories
+        logger.info("Correcting product categories...")
+        corrected = correct_all_categories(deduplicated)
+        logger.info("Category correction complete")
+
+        # Filter empty products
+        logger.info("Filtering empty products...")
+        filtered = filter_empty_products(corrected)
+        logger.info(
+            "Filtered: %d -> %d products (removed %d empty)",
+            len(corrected),
+            len(filtered),
+            len(corrected) - len(filtered),
+        )
+
+        # Wrap filtered results back into the expected format
+        completed = [{"results": filtered}]
+    else:
+        # Even without sliding window, still correct categories and filter
+        logger.info("Correcting product categories...")
+        all_products = []
+        for batch in completed:
+            all_products.extend(batch.get("results", []))
+        corrected = correct_all_categories(all_products)
+        logger.info("Category correction complete")
+
+        logger.info("Filtering empty products...")
+        filtered = filter_empty_products(corrected)
+        logger.info(
+            "Filtered: %d -> %d products (removed %d empty)",
+            len(corrected),
+            len(filtered),
+            len(corrected) - len(filtered),
+        )
+        completed = [{"results": filtered}]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(completed, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -226,6 +303,36 @@ def extract_relations_for_csv(
         "Relation extraction complete: %s (pages=%s, elapsed=%.2fs)",
         csv_path,
         len(pages),
+        time.time() - start_time,
+    )
+
+
+def extract_relations_for_csv_v2(
+    csv_path: Path,
+    output_path: Path,
+    error_log_path: Path,
+    max_concurrent: int,
+    use_sliding_window: bool = True,
+    window_size: int = 1,
+) -> None:
+    """
+    Wrapper to run the staged (brand->series->product) pipeline.
+    I/O shape matches v1: [{"results": [...] }].
+    """
+    logger = setup_relation_logger()
+    start_time = time.time()
+    logger.info("Relation extraction v2 start: %s", csv_path)
+    extract_relations_multistage(
+        csv_path,
+        output_path,
+        error_log_path,
+        max_concurrent=max_concurrent,
+        window_size=window_size,
+        use_sliding_window=use_sliding_window,
+    )
+    logger.info(
+        "Relation extraction v2 complete: %s (elapsed=%.2fs)",
+        csv_path,
         time.time() - start_time,
     )
 
@@ -326,6 +433,30 @@ def main() -> None:
         help="Max concurrent LLM calls per CSV.",
     )
     parser.add_argument(
+        "--use-sliding-window",
+        action="store_true",
+        default=True,
+        help="Use sliding window context for extraction (default: True).",
+    )
+    parser.add_argument(
+        "--no-sliding-window",
+        action="store_false",
+        dest="use_sliding_window",
+        help="Disable sliding window context.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=1,
+        help="Sliding window size (pages before/after current page, default: 1).",
+    )
+    parser.add_argument(
+        "--relation-version",
+        choices=["v1", "v2"],
+        default="v2",
+        help="Choose relation extractor pipeline (v1=page-first, v2=brand->series->product staged).",
+    )
+    parser.add_argument(
         "--combined-output",
         default="fused_entities_all.json",
         help="Combined fusion output filename.",
@@ -351,6 +482,11 @@ def main() -> None:
         fused_output = fusion_output_dir / "fused_entities_original_format.json"
         relation_exists = relation_output.exists()
         fusion_exists = fused_output.exists()
+        relation_runner = (
+            extract_relations_for_csv_v2
+            if args.relation_version == "v2"
+            else extract_relations_for_csv
+        )
 
         print(f"Processing {csv_path}...")
 
@@ -361,11 +497,13 @@ def main() -> None:
                 print(f"Skip relation extraction for {csv_path} (exists)")
             else:
                 try:
-                    extract_relations_for_csv(
+                    relation_runner(
                         csv_path,
                         relation_output,
                         error_log,
                         args.max_concurrent,
+                        use_sliding_window=args.use_sliding_window,
+                        window_size=args.window_size,
                     )
                 except Exception as exc:  # noqa: BLE001
                     append_error(error_log, "relation_extract", str(exc))
