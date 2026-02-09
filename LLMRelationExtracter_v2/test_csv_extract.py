@@ -24,7 +24,7 @@ CSV_PATH = Path(r"D:\AgentCompetitionAnalysisPlatform\results\gree_documents_all
 # Defaults: results saved beside CSV
 OUTPUT_PATH = None  # set to Path(...) to override
 ERROR_LOG_PATH = None  # set to Path(...) to override
-MAX_CONCURRENT = 10
+MAX_CONCURRENT = 100
 WINDOW_SIZE = 1
 USE_SLIDING_WINDOW = True
 SHOW_PROGRESS = True

@@ -185,10 +185,49 @@ RELATION_EXTRACTOR_CONFIG = {
     "brand_translate_device": os.getenv("BRAND_TRANSLATE_DEVICE", "cpu"),
     "enable_brand_canon": os.getenv("ENABLE_BRAND_CANON", "true").lower() == "true",
     "enable_series_stage": True,
+    "enable_model_stage": True,
     "enable_product_stage": True,
 
     # Prompt length guard
     "max_chars_per_call": int(os.getenv("MAX_CHARS_PER_CALL", 8000)),
+    "chunk_progress_preview_chars": int(os.getenv("CHUNK_PROGRESS_PREVIEW_CHARS", 64)),
+
+    # Retrieval (series/model stages)
+    "use_embedding_retrieval": os.getenv("USE_EMBEDDING_RETRIEVAL", "true").lower() == "true",
+    "retrieval_top_k": int(os.getenv("RETRIEVAL_TOP_K", 8)),
+    "retrieval_embed_model": os.getenv(
+        "RETRIEVAL_EMBED_MODEL", "BAAI/bge-m3"
+    ),
+    "retrieval_device": os.getenv("RETRIEVAL_DEVICE", os.getenv("EMBEDDING_DEVICE", "cpu")),
+    "retrieval_min_sim": float(os.getenv("RETRIEVAL_MIN_SIM", 0.1)),
+    # embed | bm25 | hybrid
+    "retrieval_method": os.getenv("RETRIEVAL_METHOD", "embed"),
+
+    # Series extraction chunking (to avoid single long prompt)
+    "series_page_chunk_size": int(os.getenv("SERIES_PAGE_CHUNK_SIZE", 4)),  # 0 = no chunking
+    "series_chunk_concurrency": int(os.getenv("SERIES_CHUNK_CONCURRENCY", 6)),
+    # Model extraction parallelism (Stage C)
+    "model_chunk_concurrency": int(os.getenv("MODEL_CHUNK_CONCURRENCY", 8)),
+    "model_pair_concurrency": int(os.getenv("MODEL_PAIR_CONCURRENCY", 6)),
+    "enable_model_cross_series_resolve": os.getenv(
+        "ENABLE_MODEL_CROSS_SERIES_RESOLVE", "true"
+    ).lower()
+    == "true",
+    # Model context (Stage C): series pages + next N pages
+    "series_context_follow_pages": int(os.getenv("SERIES_CONTEXT_FOLLOW_PAGES", 2)),
+    # Product chunk parallelism (Stage D)
+    "product_chunk_concurrency": int(os.getenv("PRODUCT_CHUNK_CONCURRENCY", 8)),
+    # Product pair parallelism (Stage D)
+    "product_pair_concurrency": int(os.getenv("PRODUCT_PAIR_CONCURRENCY", 6)),
+    # Product context: model pages + next N pages
+    "model_context_follow_pages": int(os.getenv("MODEL_CONTEXT_FOLLOW_PAGES", 2)),
+    "enable_series_semantic_merge": os.getenv("ENABLE_SERIES_SEMANTIC_MERGE", "true").lower() == "true",
+    "series_merge_embed_model": os.getenv(
+        "SERIES_MERGE_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    ),
+    "series_merge_threshold": float(os.getenv("SERIES_MERGE_THRESHOLD", 0.2)),
+    "series_merge_device": os.getenv("SERIES_MERGE_DEVICE", "cpu"),
+    "series_filter_min_keep_ratio": float(os.getenv("SERIES_FILTER_MIN_KEEP_RATIO", 0.3)),
 
     # Stage caching/checkpoints
     "force_stage_rerun": os.getenv("FORCE_STAGE_RERUN", "false").lower() == "true",

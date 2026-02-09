@@ -429,7 +429,7 @@ def main() -> None:
     parser.add_argument(
         "--max-concurrent",
         type=int,
-        default=30,
+        default=100,
         help="Max concurrent LLM calls per CSV.",
     )
     parser.add_argument(
