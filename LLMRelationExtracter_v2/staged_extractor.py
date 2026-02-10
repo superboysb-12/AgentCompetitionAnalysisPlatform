@@ -41,7 +41,9 @@ from .staged_prompts import (
     BRAND_CANON_SCHEMA,
     BRAND_SCHEMA,
     BRAND_FILTER_SCHEMA,
+    MODEL_REVIEW_SCHEMA,
     MODEL_SCHEMA,
+    PRODUCT_REVIEW_SCHEMA,
     PRODUCT_SCHEMA,
     SERIES_SCHEMA,
     SERIES_REVIEW_SCHEMA,
@@ -50,7 +52,9 @@ from .staged_prompts import (
     build_brand_global_filter_messages,
     build_brand_messages,
     build_model_messages,
+    build_model_review_messages,
     build_product_messages,
+    build_product_review_messages,
     build_series_review_messages,
     build_series_messages,
 )
@@ -156,6 +160,18 @@ def _get_embedder(model_name: str, device: str):
     if SentenceTransformer is None:
         raise ImportError("sentence-transformers not installed")
     return SentenceTransformer(model_name, device=device)
+
+
+def _get_concurrency(config: Dict, key: str, default: int) -> int:
+    """
+    Unified concurrency resolver: prefer specific key, fallback to global_concurrency,
+    then to provided default.
+    """
+    if key in config and config[key] is not None:
+        return int(config[key])
+    if "global_concurrency" in config and config["global_concurrency"] is not None:
+        return int(config["global_concurrency"])
+    return int(default)
 
 
 def _embed_texts(texts: List[str], model_name: str, device: str = "cpu") -> np.ndarray:
@@ -498,7 +514,7 @@ class StagedRelationExtractor:
             api_key=self.config["api_key"], base_url=self.config["base_url"]
         )
         self.model = self.config["model"]
-        self.semaphore = asyncio.Semaphore(self.config.get("max_concurrent", 5))
+        self.semaphore = asyncio.Semaphore(_get_concurrency(self.config, "max_concurrent", 5))
         self.timeout = self.config.get("timeout", 300)
         self.logger = self._setup_logger(log_name)
         # feature toggles for composable pipeline
@@ -1228,7 +1244,7 @@ class StagedRelationExtractor:
             if len(chunks) == 1:
                 raw_series_list = await _run_chunk(chunks[0])
             else:
-                sem = asyncio.Semaphore(int(self.config.get("series_chunk_concurrency", 6)))
+                sem = asyncio.Semaphore(_get_concurrency(self.config, "series_chunk_concurrency", 6))
 
                 async def _bounded(chunk_pages):
                     async with sem:
@@ -1279,7 +1295,7 @@ class StagedRelationExtractor:
         try:
             chunks = _split_text(text_block, self.config.get("max_chars_per_call", 8000))
             model_items: List[Dict] = []
-            chunk_sem = asyncio.Semaphore(int(self.config.get("model_chunk_concurrency", 8)))
+            chunk_sem = asyncio.Semaphore(_get_concurrency(self.config, "model_chunk_concurrency", 8))
             if getattr(self, "_show_progress", False):
                 pair_label = f"{(brand or 'unknown')[:10]}/{(series or 'all')[:12]}"
                 chunk_pbar = tqdm(
@@ -1338,7 +1354,12 @@ class StagedRelationExtractor:
                     chunk_pbar.update(1)
                 model_items.extend(chunk_models or [])
 
-            return _merge_model_candidates(model_items)
+            merged_models = _merge_model_candidates(model_items)
+            if self.config.get("enable_model_llm_review", True) and merged_models:
+                reviewed = await self._review_models_llm(brand, series, merged_models, error_log)
+                if reviewed:
+                    merged_models = reviewed
+            return merged_models
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "model_extract", {"brand": brand, "series": series}, exc)
             self.logger.error("Model extract failed for brand=%s series=%s: %s", brand, series, exc)
@@ -1346,6 +1367,72 @@ class StagedRelationExtractor:
         finally:
             if chunk_pbar:
                 chunk_pbar.close()
+
+    async def _review_products_llm(
+        self,
+        brand: str,
+        series: str,
+        products: List[Dict],
+        error_log: Path,
+    ) -> List[Dict]:
+        if not products:
+            return []
+        max_items = int(self.config.get("product_review_max_items", 50))
+        payload = products[:max_items]
+        try:
+            result = await self._acall(
+                build_product_review_messages(brand, series, payload),
+                PRODUCT_REVIEW_SCHEMA,
+                "product_review_schema",
+                {"brand": brand, "series": series, "count": len(payload)},
+            )
+            verdicts = {item.get("product_model", "").strip(): item for item in result.get("products", [])}
+            reviewed: List[Dict] = []
+            for prod in payload:
+                model_key = (prod.get("product_model") or "").strip()
+                decision = verdicts.get(model_key)
+                if decision is None:
+                    reviewed.append(prod)
+                    continue
+                if decision.get("keep") and not decision.get("is_accessory"):
+                    reviewed.append(prod)
+            return reviewed or products
+        except Exception as exc:  # noqa: BLE001
+            _append_error(error_log, "product_review", {"brand": brand, "series": series}, exc)
+            self.logger.warning("Product LLM review failed for %s/%s: %s", brand, series, exc)
+            return products
+
+    async def _review_models_llm(
+        self,
+        brand: str,
+        series: str,
+        candidates: List[Dict],
+        error_log: Path,
+    ) -> List[Dict]:
+        if not candidates:
+            return []
+        max_items = int(self.config.get("model_review_max_items", 80))
+        payload = candidates[:max_items]
+        try:
+            result = await self._acall(
+                build_model_review_messages(brand, series, payload),
+                MODEL_REVIEW_SCHEMA,
+                "model_review_schema",
+                {"brand": brand, "series": series, "count": len(payload)},
+            )
+            verdicts = {item.get("name", "").strip(): item for item in result.get("items", [])}
+            reviewed: List[Dict] = []
+            for cand in payload:
+                name = (cand.get("name") or "").strip()
+                decision = verdicts.get(name)
+                if decision and decision.get("keep") and decision.get("kind") == "model":
+                    reviewed.append(cand)
+            # fallback: avoid empty due to over-prune
+            return reviewed or candidates
+        except Exception as exc:  # noqa: BLE001
+            _append_error(error_log, "model_review", {"brand": brand, "series": series}, exc)
+            self.logger.warning("Model LLM review failed for %s/%s: %s", brand, series, exc)
+            return candidates
 
     async def extract_models(
         self,
@@ -1370,7 +1457,7 @@ class StagedRelationExtractor:
         if getattr(self, "_show_progress", False):
             pbar = tqdm(total=len(pairs), desc="Stage C: models", unit="pair")
 
-        pair_limit = max(1, int(self.config.get("model_pair_concurrency", 6)))
+        pair_limit = max(1, _get_concurrency(self.config, "model_pair_concurrency", 6))
         pair_sem = asyncio.Semaphore(pair_limit)
         self.logger.info("Stage C model pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
 
@@ -1400,10 +1487,21 @@ class StagedRelationExtractor:
                     base_pages,
                     follow_after=follow_after,
                 )
+                if not relevant_pages and base_pages:
+                    # Retry strictly within declared series pages when occurrence search failed.
+                    relevant_pages = _select_pages_by_numbers_with_following(
+                        pages,
+                        base_pages,
+                        follow_after=0,
+                    )
                 if not relevant_pages:
-                    # Keep fallback for sparse/dirty series evidence cases.
-                    relevant_pages = list(pages)
-                text_block = _combine_pages(relevant_pages or pages)
+                    self.logger.warning(
+                        "Stage C: no context pages for brand=%s series=%s; skip pair to avoid noise",
+                        brand,
+                        series_name,
+                    )
+                    return _pair_key(brand, series_name), []
+                text_block = _combine_pages(relevant_pages)
                 pair_models = await self._extract_models_for_pair(
                     brand,
                     series_name,
@@ -1441,7 +1539,8 @@ class StagedRelationExtractor:
         for task in asyncio.as_completed(tasks):
             pair_key, pair_models = await task
             existing = models_by_pair.get(pair_key, [])
-            models_by_pair[pair_key] = _merge_model_candidates(existing + pair_models)
+            merged = _merge_model_candidates(existing + pair_models)
+            models_by_pair[pair_key] = merged
             if pbar:
                 pbar.update(1)
         if pbar:
@@ -1494,7 +1593,7 @@ class StagedRelationExtractor:
         try:
             chunks = _split_text(text_block, self.config.get("max_chars_per_call", 8000))
             products = []
-            chunk_sem = asyncio.Semaphore(int(self.config.get("product_chunk_concurrency", 8)))
+            chunk_sem = asyncio.Semaphore(_get_concurrency(self.config, "product_chunk_concurrency", 8))
             if getattr(self, "_show_progress", False):
                 pair_label = f"{(brand or 'unknown')[:10]}/{(series or 'all')[:12]}"
                 chunk_pbar = tqdm(
@@ -1587,7 +1686,7 @@ class StagedRelationExtractor:
         if getattr(self, "_show_progress", False):
             pbar = tqdm(total=len(pairs), desc="Stage D: products", unit="pair")
 
-        pair_limit = max(1, int(self.config.get("product_pair_concurrency", 6)))
+        pair_limit = max(1, _get_concurrency(self.config, "product_pair_concurrency", 6))
         pair_sem = asyncio.Semaphore(pair_limit)
         self.logger.info("Stage C pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
 
@@ -1613,16 +1712,28 @@ class StagedRelationExtractor:
                 if not model_hit_pages:
                     for model_item in pair_models:
                         model_hit_pages.extend(model_item.get("pages", []))
-                if not model_hit_pages:
+                if not model_hit_pages and series_pages:
                     model_hit_pages.extend(series_pages)
 
+                follow_after = int(self.config.get("model_context_follow_pages", 2))
                 relevant_pages = _select_pages_by_numbers_with_following(
                     pages,
                     _dedup_list(model_hit_pages),
-                    follow_after=int(self.config.get("model_context_follow_pages", 2)),
+                    follow_after=follow_after,
                 )
+                if not relevant_pages and series_pages:
+                    relevant_pages = _select_pages_by_numbers_with_following(
+                        pages,
+                        _dedup_list(series_pages),
+                        follow_after=follow_after,
+                    )
                 if not relevant_pages:
-                    relevant_pages = list(pages)
+                    self.logger.warning(
+                        "Stage D: no context pages for brand=%s series=%s; skip pair to avoid noise",
+                        brand,
+                        series_name,
+                    )
+                    return pair_index, []
                 text_block = _combine_pages(relevant_pages)
                 page_refs = [meta.get("page") for _, meta in relevant_pages]
                 extracted = await self._extract_products_for_pair(
@@ -1633,7 +1744,15 @@ class StagedRelationExtractor:
                     known_models,
                     error_log,
                 )
-                return pair_index, extracted
+                processed = list(extracted)
+                if self.config.get("enable_product_llm_review", True) and processed:
+                    processed = await self._review_products_llm(
+                        brand,
+                        series_name,
+                        processed,
+                        error_log,
+                    )
+                return pair_index, processed
             except Exception as exc:  # noqa: BLE001
                 _append_error(
                     error_log,
@@ -1672,7 +1791,7 @@ class StagedRelationExtractor:
 
         for pair_index in range(len(pairs)):
             products.extend(result_map.get(pair_index, []))
-        products = _deduplicate_products_by_model(products)
+        products = _deduplicate_products_by_model(products, self.config)
 
         if pbar:
             pbar.close()
@@ -1876,16 +1995,15 @@ def _collect_model_occurrence_pages(
     stats: Dict[str, List] = {}
     if not model_names or not pages:
         return stats
-    page_texts = [
-        (_normalize_model_key(text), meta.get("page"))
-        for text, meta in pages
-    ]
+    normalized_pages = [(_normalize_model_key(text), meta.get("page")) for text, meta in pages]
     for model_name in _dedup_list([m for m in model_names if m]):
         key = _normalize_model_key(model_name)
         if not key:
             continue
         hit_pages = []
-        for normalized_text, page_id in page_texts:
+        for normalized_text, page_id in normalized_pages:
+            if not normalized_text:
+                continue
             if key in normalized_text:
                 hit_pages.append(page_id)
         stats[model_name] = _dedup_list(hit_pages)
@@ -2075,7 +2193,48 @@ def _canonicalize_models_by_pair(models_by_pair: Dict[str, List[Dict]]) -> Dict[
     return out
 
 
-def _deduplicate_products_by_model(products: List[Dict]) -> List[Dict]:
+def _normalize_spec_key(name: str) -> str:
+    return re.sub(r"[\s：:|/\\-]+", "", (name or "")).lower()
+
+
+def _pick_best_spec_entry(entries: List[Dict]) -> Dict:
+    """Select the most informative spec entry among duplicates."""
+    def _score(spec: Dict) -> Tuple[int, int, int]:
+        unit = 1 if spec.get("unit") else 0
+        has_digit = 1 if re.search(r"\d", str(spec.get("value", ""))) else 0
+        length = len(str(spec.get("value", "")))
+        return (unit, has_digit, length)
+
+    sorted_entries = sorted(entries, key=_score, reverse=True)
+    return dict(sorted_entries[0]) if sorted_entries else {}
+
+
+def _enforce_single_value_specs(product: Dict, config: Dict) -> Dict:
+    targets = {
+        _normalize_spec_key(name)
+        for name in (config.get("single_value_performance_specs") or [])
+        if _normalize_spec_key(name)
+    }
+    if not targets:
+        return product
+    specs = product.get("performance_specs") or []
+    grouped: Dict[str, List[Dict]] = {}
+    kept: List[Dict] = []
+    for spec in specs:
+        key = _normalize_spec_key(spec.get("name", ""))
+        if key in targets:
+            grouped.setdefault(key, []).append(spec)
+        else:
+            kept.append(spec)
+    for entries in grouped.values():
+        best = _pick_best_spec_entry(entries)
+        if best:
+            kept.append(best)
+    product["performance_specs"] = kept
+    return product
+
+
+def _deduplicate_products_by_model(products: List[Dict], config: Optional[Dict] = None) -> List[Dict]:
     """
     Deduplicate products by normalized product_model to reduce repeats where
     category/fields differ across chunks for the same model.
@@ -2127,6 +2286,7 @@ def _deduplicate_products_by_model(products: List[Dict]) -> List[Dict]:
                 if spec_key not in merged_specs:
                     merged_specs[spec_key] = spec
             base["performance_specs"] = list(merged_specs.values())
+        base = _enforce_single_value_specs(base, config or {})
         merged_products.append(base)
     return merged_products
 
@@ -2150,6 +2310,7 @@ def extract_relations_multistage(
     logger = logging.getLogger("relation_extract_batch_v2")
     logger.setLevel(logging.INFO)
 
+    use_sliding_window = use_sliding_window and not cfg.get("v2_disable_loader_sliding_window", True)
     effective_window = window_size if use_sliding_window else 0
     pages = list(
         load_pages_with_context_v2(

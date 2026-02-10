@@ -213,6 +213,8 @@ RELATION_EXTRACTOR_CONFIG = {
         "ENABLE_MODEL_CROSS_SERIES_RESOLVE", "true"
     ).lower()
     == "true",
+    "enable_model_llm_review": os.getenv("ENABLE_MODEL_LLM_REVIEW", "true").lower() == "true",
+    "model_review_max_items": int(os.getenv("MODEL_REVIEW_MAX_ITEMS", 80)),
     # Model context (Stage C): series pages + next N pages
     "series_context_follow_pages": int(os.getenv("SERIES_CONTEXT_FOLLOW_PAGES", 2)),
     # Product chunk parallelism (Stage D)
@@ -221,6 +223,20 @@ RELATION_EXTRACTOR_CONFIG = {
     "product_pair_concurrency": int(os.getenv("PRODUCT_PAIR_CONCURRENCY", 6)),
     # Product context: model pages + next N pages
     "model_context_follow_pages": int(os.getenv("MODEL_CONTEXT_FOLLOW_PAGES", 2)),
+    "enable_product_llm_review": os.getenv("ENABLE_PRODUCT_LLM_REVIEW", "true").lower() == "true",
+    "product_review_max_items": int(os.getenv("PRODUCT_REVIEW_MAX_ITEMS", 50)),
+    # Unified concurrency override (if set, applies to all stage semaphores)
+    "global_concurrency": os.getenv("GLOBAL_CONCURRENCY", None),
+    "single_value_performance_specs": (
+        os.getenv(
+            "SINGLE_VALUE_PERFORMANCE_SPECS",
+            "电源,电压,电源电压,制冷量,制热量,额定功率,额定电流,风量,噪音,重量,尺寸,COP,EER,IPLV,SEER,APF,HSPF",
+        ).split(",")
+    ),
+    "v2_disable_loader_sliding_window": os.getenv(
+        "V2_DISABLE_LOADER_SLIDING_WINDOW", "true"
+    ).lower()
+    == "true",
     "enable_series_semantic_merge": os.getenv("ENABLE_SERIES_SEMANTIC_MERGE", "true").lower() == "true",
     "series_merge_embed_model": os.getenv(
         "SERIES_MERGE_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

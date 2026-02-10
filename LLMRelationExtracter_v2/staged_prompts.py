@@ -77,6 +77,26 @@ MODEL_SCHEMA: Dict = {
     },
     "required": ["brand", "series", "models"],
 }
+MODEL_REVIEW_SCHEMA: Dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "keep": {"type": "boolean"},
+                    "kind": {"type": "string", "enum": ["model", "series", "other"]},
+                },
+                "required": ["name", "keep", "kind"],
+            },
+        }
+    },
+    "required": ["items"],
+}
 SERIES_FILTER_SCHEMA: Dict = {
     "type": "object",
     "additionalProperties": False,
@@ -131,6 +151,26 @@ BRAND_CANON_SCHEMA: Dict = {
         }
     },
     "required": ["items"],
+}
+PRODUCT_REVIEW_SCHEMA: Dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "products": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "product_model": {"type": "string"},
+                    "keep": {"type": "boolean"},
+                    "is_accessory": {"type": "boolean"},
+                },
+                "required": ["product_model", "keep", "is_accessory"],
+            },
+        }
+    },
+    "required": ["products"],
 }
 
 
@@ -393,6 +433,74 @@ def build_brand_canon_messages(candidates: List[Dict]) -> List[Dict]:
             "content": (
                 "Normalize each brand to Chinese canonical form. One output per input.\n\n"
                 + "\n".join(lines)
+            ),
+        },
+    ]
+
+
+def build_model_review_messages(
+    brand: str,
+    series: str,
+    candidates: List[Dict],
+) -> List[Dict]:
+    lines = []
+    for idx, item in enumerate(candidates, 1):
+        evid = "; ".join(item.get("evidence", [])[:2])
+        lines.append(f"{idx}. name={item.get('name','')} | evidence={evid}")
+    user_block = "\n".join(lines)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are verifying HVAC product model candidates. "
+                "For each name decide if it is a concrete product MODEL (keep=true) "
+                "vs series/line/other (keep=false). "
+                "Do not invent or rewrite names. Use evidence snippets only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Brand: {brand or '<unknown>'}\n"
+                f"Series: {series or '<unknown>'}\n"
+                "Label each candidate with kind ∈ {model, series, other} and keep=true only if it is a model.\n\n"
+                f"{user_block}"
+            ),
+        },
+    ]
+
+
+def build_product_review_messages(
+    brand: str,
+    series: str,
+    products: List[Dict],
+) -> List[Dict]:
+    lines = []
+    for idx, item in enumerate(products, 1):
+        evid = "; ".join(item.get("evidence", [])[:2])
+        facts = "; ".join(item.get("fact_text", [])[:1])
+        lines.append(
+            f"{idx}. model={item.get('product_model','')} | category={item.get('category','')} "
+            f"| evidence={evid} | fact={facts}"
+        )
+    user_block = "\n".join(lines)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are reviewing structured HVAC product candidates. "
+                "Mark is_accessory=true only for accessories/optional controllers/parts; otherwise false. "
+                "Set keep=true if the evidence supports that this is a real product entry "
+                "and not merely a heading/list/series/accessory-only line."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Brand: {brand or '<unknown>'}\n"
+                f"Series: {series or '<unknown>'}\n"
+                "Return keep/is_accessory for each product.\n\n"
+                f"{user_block}"
             ),
         },
     ]
