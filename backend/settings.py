@@ -185,26 +185,57 @@ RELATION_EXTRACTOR_CONFIG = {
     "brand_translate_device": os.getenv("BRAND_TRANSLATE_DEVICE", "cpu"),
     "enable_brand_canon": os.getenv("ENABLE_BRAND_CANON", "true").lower() == "true",
     "enable_series_stage": True,
+    "series_keyword_boost": [
+        k
+        for k in os.getenv(
+            "SERIES_KEYWORD_BOOST",
+            "SDB,SDC+,SDC,SDE,SDZ,SDTD",
+        ).split(",")
+        if k
+    ],
+    # 默认不启用硬编码过滤；如需再加启发式可通过环境变量覆盖
+    "series_drop_keywords": [
+        k
+        for k in os.getenv(
+            "SERIES_DROP_KEYWORDS",
+            "",
+        ).split(",")
+        if k
+    ],
     "enable_model_stage": True,
     "enable_product_stage": True,
 
     # Prompt length guard
     "max_chars_per_call": int(os.getenv("MAX_CHARS_PER_CALL", 8000)),
     "chunk_progress_preview_chars": int(os.getenv("CHUNK_PROGRESS_PREVIEW_CHARS", 64)),
+    "table_row_exhaust_mode": os.getenv("TABLE_ROW_EXHAUST_MODE", "true").lower() == "true",
+    "table_rows_per_block": int(os.getenv("TABLE_ROWS_PER_BLOCK", 12)),
+    "table_row_cell_clip": int(os.getenv("TABLE_ROW_CELL_CLIP", 0)),
+    "table_rows_clip_chars": int(os.getenv("TABLE_ROWS_CLIP_CHARS", 4000)),
 
-    # Retrieval (series/model stages)
-    "use_embedding_retrieval": os.getenv("USE_EMBEDDING_RETRIEVAL", "true").lower() == "true",
-    "retrieval_top_k": int(os.getenv("RETRIEVAL_TOP_K", 8)),
-    "retrieval_embed_model": os.getenv(
-        "RETRIEVAL_EMBED_MODEL", "BAAI/bge-m3"
+    # Retrieval (series/model stages): keyword-only evidence recall in v2.
+    "retrieval_method": os.getenv("RETRIEVAL_METHOD", "keyword"),
+    "retrieval_top_k": int(os.getenv("RETRIEVAL_TOP_K", 0)),  # 0 = keep all matched pages
+    "keyword_retrieval_top_k": int(
+        os.getenv("KEYWORD_RETRIEVAL_TOP_K", os.getenv("RETRIEVAL_TOP_K", "0"))
     ),
+    "keyword_retrieval_min_hits": int(os.getenv("KEYWORD_RETRIEVAL_MIN_HITS", 1)),
+    # any | all
+    "keyword_retrieval_match_mode": os.getenv("KEYWORD_RETRIEVAL_MATCH_MODE", "any"),
+    # Legacy fields retained for backward compatibility; no longer used for retrieval.
+    "use_embedding_retrieval": os.getenv("USE_EMBEDDING_RETRIEVAL", "false").lower() == "true",
+    "retrieval_embed_model": os.getenv("RETRIEVAL_EMBED_MODEL", "BAAI/bge-m3"),
     "retrieval_device": os.getenv("RETRIEVAL_DEVICE", os.getenv("EMBEDDING_DEVICE", "cpu")),
     "retrieval_min_sim": float(os.getenv("RETRIEVAL_MIN_SIM", 0.1)),
-    # embed | bm25 | hybrid
-    "retrieval_method": os.getenv("RETRIEVAL_METHOD", "embed"),
 
-    # Series extraction chunking (to avoid single long prompt)
-    "series_page_chunk_size": int(os.getenv("SERIES_PAGE_CHUNK_SIZE", 4)),  # 0 = no chunking
+    # Series extraction context (Stage B)
+    "series_from_brand_evidence": os.getenv("SERIES_FROM_BRAND_EVIDENCE", "true").lower() == "true",
+    # For each Stage-A brand evidence page, include this many following pages.
+    "series_brand_follow_pages": int(os.getenv("SERIES_BRAND_FOLLOW_PAGES", 1)),
+    # Stage-B page grouping size for each LLM call; extractor coerces to 2 or 3.
+    "series_brand_chunk_pages": int(os.getenv("SERIES_BRAND_CHUNK_PAGES", 2)),
+    # Legacy field kept for compatibility with older scripts.
+    "series_page_chunk_size": int(os.getenv("SERIES_PAGE_CHUNK_SIZE", 4)),
     "series_chunk_concurrency": int(os.getenv("SERIES_CHUNK_CONCURRENCY", 6)),
     # Model extraction parallelism (Stage C)
     "model_chunk_concurrency": int(os.getenv("MODEL_CHUNK_CONCURRENCY", 8)),
@@ -214,6 +245,9 @@ RELATION_EXTRACTOR_CONFIG = {
     ).lower()
     == "true",
     "enable_model_llm_review": os.getenv("ENABLE_MODEL_LLM_REVIEW", "true").lower() == "true",
+    "model_review_redirect": os.getenv("MODEL_REVIEW_REDIRECT", "true").lower() == "true",
+    "model_review_drop_mismatch": os.getenv("MODEL_REVIEW_DROP_MISMATCH", "false").lower() == "true",
+    "model_redirect_min_conf": float(os.getenv("MODEL_REDIRECT_MIN_CONF", 0.5)),
     "model_review_max_items": int(os.getenv("MODEL_REVIEW_MAX_ITEMS", 80)),
     # Model context (Stage C): series pages + next N pages
     "series_context_follow_pages": int(os.getenv("SERIES_CONTEXT_FOLLOW_PAGES", 2)),
@@ -221,9 +255,23 @@ RELATION_EXTRACTOR_CONFIG = {
     "product_chunk_concurrency": int(os.getenv("PRODUCT_CHUNK_CONCURRENCY", 8)),
     # Product pair parallelism (Stage D)
     "product_pair_concurrency": int(os.getenv("PRODUCT_PAIR_CONCURRENCY", 6)),
+    # Stage-D model-target extraction: one model-focused prompt at a time.
+    "stage_d_target_model_mode": os.getenv("STAGE_D_TARGET_MODEL_MODE", "true").lower() == "true",
+    "product_model_concurrency": int(os.getenv("PRODUCT_MODEL_CONCURRENCY", 6)),
     # Product context: model pages + next N pages
     "model_context_follow_pages": int(os.getenv("MODEL_CONTEXT_FOLLOW_PAGES", 2)),
     "enable_product_llm_review": os.getenv("ENABLE_PRODUCT_LLM_REVIEW", "true").lower() == "true",
+    # Force Stage-D product_model to align with Stage-C models of the same pair.
+    "product_model_must_from_stage_c": os.getenv("PRODUCT_MODEL_MUST_FROM_STAGE_C", "true").lower()
+    == "true",
+    "product_model_drop_if_unknown": os.getenv("PRODUCT_MODEL_DROP_IF_UNKNOWN", "true").lower()
+    == "true",
+    "product_model_match_in_evidence": os.getenv("PRODUCT_MODEL_MATCH_IN_EVIDENCE", "true").lower()
+    == "true",
+    "product_model_expand_multi_match": os.getenv("PRODUCT_MODEL_EXPAND_MULTI_MATCH", "true").lower()
+    == "true",
+    "product_model_multi_match_cap": int(os.getenv("PRODUCT_MODEL_MULTI_MATCH_CAP", 12)),
+    "series_feature_to_series": os.getenv("SERIES_FEATURE_TO_SERIES", "true").lower() == "true",
     "product_review_max_items": int(os.getenv("PRODUCT_REVIEW_MAX_ITEMS", 50)),
     # Unified concurrency override (if set, applies to all stage semaphores)
     "global_concurrency": os.getenv("GLOBAL_CONCURRENCY", None),

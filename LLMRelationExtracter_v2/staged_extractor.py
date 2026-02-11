@@ -24,11 +24,6 @@ try:
 except ImportError:  # pragma: no cover - fallback handled later
     SentenceTransformer = None
 
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:  # pragma: no cover
-    BM25Okapi = None
-
 from backend.settings import RELATION_EXTRACTOR_CONFIG
 from LLMRelationExtracter import (  # v1 复用的通用模块
     correct_all_categories,
@@ -97,6 +92,19 @@ def _normalize_series_key(text: str) -> str:
     return normalized.replace("系列", "")
 
 
+def _match_series_name(series_guess: str, brand: str, alias_map: Dict[str, Dict[str, List[str]]]) -> Optional[str]:
+    "Return canonical series name within a brand if guess matches alias/canonical."
+    guess_key = _normalize_series_key(series_guess)
+    if not guess_key:
+        return None
+    brand_map = alias_map.get(brand, {}) if alias_map else {}
+    for canonical, aliases in brand_map.items():
+        for name in [canonical] + aliases:
+            if _normalize_series_key(name) == guess_key:
+                return canonical
+    return None
+
+
 _MODEL_CHAR_TRANSLATION = str.maketrans(
     {
         "＋": "+",
@@ -153,6 +161,10 @@ def _split_pair_key(key: str) -> Tuple[str, str]:
     if len(parts) == 2:
         return parts[0], parts[1]
     return key or "", ""
+
+
+def _model_node_key(brand: str, series: str, model_name: str) -> str:
+    return f"{brand}|||{series}|||{_normalize_model_key(model_name)}"
 
 
 @lru_cache(maxsize=2)
@@ -259,14 +271,21 @@ def _merge_model_candidates(model_items: List[Dict]) -> List[Dict]:
         if not key:
             continue
         if key not in merged:
-            merged[key] = {
+            base = {
                 "name": name,
                 "evidence": list(item.get("evidence", [])),
                 "pages": list(item.get("pages", [])),
             }
+            for parent_field in ("brand", "series", "pair_key", "model_key"):
+                if item.get(parent_field):
+                    base[parent_field] = item.get(parent_field)
+            merged[key] = base
         else:
             merged[key]["evidence"].extend(item.get("evidence", []))
             merged[key]["pages"].extend(item.get("pages", []))
+            for parent_field in ("brand", "series", "pair_key", "model_key"):
+                if item.get(parent_field) and not merged[key].get(parent_field):
+                    merged[key][parent_field] = item.get(parent_field)
     out: List[Dict] = []
     for value in merged.values():
         value["evidence"] = _dedup_list(value.get("evidence", []))
@@ -470,6 +489,25 @@ def _chunk_preview(text: str, max_chars: int = 64) -> str:
     return compact[: max_chars - 3] + "..."
 
 
+def _looks_like_series_feature(model_text: str) -> bool:
+    """Lightweight heuristic to catch series-level headings/ranges when LLM misses them."""
+    t = str(model_text or "")
+    lower = t.lower()
+    if "系列" in t or "series" in lower:
+        return True
+    if re.search(r"[A-Za-z0-9]{2,}\\s*[~\\-]\\s*[A-Za-z0-9]{2,}", t):
+        return True
+    return False
+
+
+def _contains_any_keyword(text: str, keywords: List[str]) -> bool:
+    t = str(text or "").lower()
+    for kw in keywords or []:
+        if kw and kw.lower() in t:
+            return True
+    return False
+
+
 def _default_product_template() -> Dict:
     return {
         "brand": "",
@@ -525,62 +563,31 @@ class StagedRelationExtractor:
         self.enable_product_stage = self.config.get("enable_product_stage", True)
         self.brand_alias_map: Dict[str, List[str]] = {}
         self.series_alias_map: Dict[str, Dict[str, List[str]]] = {}
+        self.series_feature_map: Dict[str, Dict[str, List[Dict]]] = {}
         self.models_by_pair: Dict[str, List[Dict]] = {}
         self.model_page_stats: Dict[str, List] = {}
         self.model_conflicts: Dict[str, Dict] = {}
+        self.model_redirects: List[Dict] = []
 
     def _retrieve_pages(
         self, keywords: List[str], pages: Sequence[Tuple[str, Dict]]
     ) -> List[Tuple[str, Dict]]:
         """
-        Embedding-based retrieval with keyword fallback to avoid missing pages that only
-        contain models/parameters.
+        Keyword-only retrieval for stage evidence recall.
+        BM25/embedding paths are intentionally disabled.
         """
-        method = str(self.config.get("retrieval_method", "embed")).lower()
-        use_embed = method in ("embed", "hybrid") and SentenceTransformer is not None and self.config.get("use_embedding_retrieval", True)
-        use_bm25 = method in ("bm25", "hybrid") and BM25Okapi is not None
-
-        query = " | ".join([k for k in keywords if k])
-        collected: List[Tuple[str, Dict]] = []
-
-        if use_embed:
-            try:
-                emb_hits = _retrieve_pages_by_embedding(
-                    pages,
-                    query=query,
-                    model_name=self.config.get("retrieval_embed_model", "BAAI/bge-m3"),
-                    device=self.config.get("retrieval_device", "cpu"),
-                    top_k=int(self.config.get("retrieval_top_k", 8)),
-                    min_sim=float(self.config.get("retrieval_min_sim", 0.1)),
+        return _select_pages_by_keywords(
+            pages,
+            keywords,
+            top_k=int(
+                self.config.get(
+                    "keyword_retrieval_top_k",
+                    self.config.get("retrieval_top_k", 0),
                 )
-                collected.extend(emb_hits)
-            except Exception:
-                self.logger.debug("Embedding retrieval failed; will try other methods", exc_info=True)
-
-        if use_bm25:
-            try:
-                bm_hits = _retrieve_pages_by_bm25(
-                    pages,
-                    query=query,
-                    top_k=int(self.config.get("retrieval_top_k", 8)),
-                )
-                collected.extend(bm_hits)
-            except Exception:
-                self.logger.debug("BM25 retrieval failed; will try fallback", exc_info=True)
-
-        # dedup while preserving order
-        seen_ids = set()
-        deduped = []
-        for item in collected:
-            if id(item) in seen_ids:
-                continue
-            seen_ids.add(id(item))
-            deduped.append(item)
-
-        if deduped:
-            return deduped
-
-        return _select_pages_by_keywords(pages, keywords)
+            ),
+            min_hits=int(self.config.get("keyword_retrieval_min_hits", 1)),
+            match_mode=str(self.config.get("keyword_retrieval_match_mode", "any")),
+        )
 
     def _setup_logger(self, name: str) -> logging.Logger:
         logger = logging.getLogger(name)
@@ -1060,7 +1067,12 @@ class StagedRelationExtractor:
 
     # -------------------------- Stage B: series ---------------------------- #
     async def _extract_series_for_brand(
-        self, brand: str, combined_text: str, error_log: Path, page_refs: Optional[List] = None
+        self,
+        brand: str,
+        combined_text: str,
+        error_log: Path,
+        page_refs: Optional[List] = None,
+        stage_a_pages: Optional[List] = None,
     ) -> List[Dict]:
         chunk_pbar = None
         try:
@@ -1080,10 +1092,15 @@ class StagedRelationExtractor:
                         _chunk_preview(chunk, int(self.config.get("chunk_progress_preview_chars", 64)))
                     )
                 payload = await self._acall(
-                    build_series_messages(brand, chunk),
+                    build_series_messages(
+                        brand,
+                        chunk,
+                        stage_a_pages=stage_a_pages,
+                        chunk_pages=page_refs,
+                    ),
                     SERIES_SCHEMA,
                     "series_schema",
-                    {"brand": brand},
+                    {"brand": brand, "stage_a_pages": stage_a_pages or [], "chunk_pages": page_refs or []},
                 )
                 if chunk_pbar:
                     chunk_pbar.update(1)
@@ -1107,6 +1124,12 @@ class StagedRelationExtractor:
                 v["evidence"] = _dedup_list(v.get("evidence", []))
                 v["pages"] = _dedup_list(v.get("pages", []))
                 merged_list.append(v)
+            if page_refs:
+                chunk_pages = _dedup_list([p for p in page_refs if p is not None and str(p) != ""])
+                for item in merged_list:
+                    merged_pages = item.get("pages", [])
+                    if not merged_pages:
+                        item["pages"] = chunk_pages
             return merged_list
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "series_extract", {"brand": brand}, exc)
@@ -1115,6 +1138,49 @@ class StagedRelationExtractor:
         finally:
             if chunk_pbar:
                 chunk_pbar.close()
+
+    def _resolve_series_chunk_size(self) -> int:
+        """
+        Stage-B pages are grouped into 2 or 3 pages per LLM call.
+        """
+        raw = int(
+            self.config.get(
+                "series_brand_chunk_pages",
+                self.config.get("series_page_chunk_size", 2),
+            )
+        )
+        return 2 if raw <= 2 else 3
+
+    def _collect_series_context_pages(
+        self,
+        brand_item: Dict,
+        pages: Sequence[Tuple[str, Dict]],
+        keywords: List[str],
+    ) -> Tuple[List[Tuple[str, Dict]], List]:
+        """
+        Prefer Stage-A brand evidence pages + following N pages for Stage-B context.
+        Fall back to keyword retrieval when evidence pages are unavailable.
+        """
+        stage_a_pages = _dedup_list(
+            [
+                p
+                for p in (brand_item.get("pages", []) or [])
+                if p is not None and str(p) != ""
+            ]
+        )
+        use_brand_evidence = bool(self.config.get("series_from_brand_evidence", True))
+
+        if use_brand_evidence and stage_a_pages:
+            follow_after = int(self.config.get("series_brand_follow_pages", 1))
+            from_stage_a = _select_pages_by_numbers_with_following(
+                pages,
+                stage_a_pages,
+                follow_after=follow_after,
+            )
+            if from_stage_a:
+                return from_stage_a, stage_a_pages
+
+        return self._retrieve_pages(keywords, pages), stage_a_pages
 
     async def _review_series_for_brand(
         self, brand: str, candidates: List[Dict], error_log: Path
@@ -1229,17 +1295,39 @@ class StagedRelationExtractor:
         for brand_item in iterator:
             brand_name = brand_item["name"]
             brand_aliases = self.brand_alias_map.get(brand_name, []) if hasattr(self, "brand_alias_map") else []
-            keywords = _dedup_list([brand_name] + brand_aliases)
-            relevant_pages = self._retrieve_pages(keywords, pages)
+            series_keyword_boost = self.config.get("series_keyword_boost", [])
+            if isinstance(series_keyword_boost, str):
+                series_keyword_boost = [
+                    k.strip() for k in series_keyword_boost.split(",") if k.strip()
+                ]
+            keywords = _dedup_list([brand_name] + brand_aliases + list(series_keyword_boost))
+            relevant_pages, stage_a_pages = self._collect_series_context_pages(
+                brand_item,
+                pages,
+                keywords,
+            )
 
-            # chunk pages to speed up long docs
-            chunk_size = int(self.config.get("series_page_chunk_size", 0))
+            # Stage-B page grouping: 2 or 3 pages per chunk.
+            chunk_size = self._resolve_series_chunk_size()
             chunks = _chunk_sequence(relevant_pages, chunk_size)
             raw_series_list: List[Dict] = []
 
             async def _run_chunk(chunk_pages: Sequence[Tuple[str, Dict]]) -> List[Dict]:
-                combined = _combine_pages(chunk_pages)
-                return await self._extract_series_for_brand(brand_name, combined, error_log)
+                combined = _combine_pages(chunk_pages, self.config)
+                chunk_refs = _dedup_list(
+                    [
+                        meta.get("page")
+                        for _, meta in chunk_pages
+                        if meta.get("page") is not None and str(meta.get("page")) != ""
+                    ]
+                )
+                return await self._extract_series_for_brand(
+                    brand_name,
+                    combined,
+                    error_log,
+                    page_refs=chunk_refs,
+                    stage_a_pages=stage_a_pages,
+                )
 
             if len(chunks) == 1:
                 raw_series_list = await _run_chunk(chunks[0])
@@ -1281,7 +1369,7 @@ class StagedRelationExtractor:
                 pbar.update(1)
         if pbar:
             pbar.close()
-        return brand_to_series
+        return _enrich_series_by_brand(brand_to_series)
 
     # -------------------------- Stage C: models ---------------------------- #
     async def _extract_models_for_pair(
@@ -1388,19 +1476,148 @@ class StagedRelationExtractor:
             )
             verdicts = {item.get("product_model", "").strip(): item for item in result.get("products", [])}
             reviewed: List[Dict] = []
+            enable_series_feature = bool(self.config.get("series_feature_to_series", False))
             for prod in payload:
                 model_key = (prod.get("product_model") or "").strip()
+                category_key = (prod.get("category") or "").strip()
                 decision = verdicts.get(model_key)
                 if decision is None:
                     reviewed.append(prod)
                     continue
-                if decision.get("keep") and not decision.get("is_accessory"):
+                role = decision.get("role")
+                if role == "series_feature" and enable_series_feature:
+                    self._store_series_feature(brand, series, prod, decision)
+                    continue
+                if role == "accessory":
+                    continue
+                if decision.get("keep") and role in (None, "product") and not decision.get("is_accessory"):
                     reviewed.append(prod)
             return reviewed or products
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "product_review", {"brand": brand, "series": series}, exc)
             self.logger.warning("Product LLM review failed for %s/%s: %s", brand, series, exc)
             return products
+
+    def _store_series_feature(
+        self,
+        brand: str,
+        series: str,
+        prod: Dict,
+        decision: Optional[Dict] = None,
+    ) -> None:
+        """Persist series-level feature/benefit snippets for later reuse."""
+        series_key = series or ""
+        brand_bucket = self.series_feature_map.setdefault(brand, {})
+        feature_list = brand_bucket.setdefault(series_key, [])
+        entry = {
+            "title": prod.get("product_model", ""),
+            "fact_text": prod.get("fact_text", []),
+            "features": prod.get("features", []),
+            "performance_specs": prod.get("performance_specs", []),
+            "evidence": _dedup_list(prod.get("evidence", [])),
+            "source_category": prod.get("category", ""),
+        }
+        if decision is not None:
+            entry["series_feature_flag"] = bool(decision.get("series_feature", False))
+        title_norm = _normalize_name(entry.get("title", ""))
+        if any(_normalize_name(item.get("title", "")) == title_norm for item in feature_list):
+            return
+        feature_list.append(entry)
+
+    def _bind_products_to_known_models(
+        self,
+        brand: str,
+        series: str,
+        products: List[Dict],
+        known_models: Optional[List[str]],
+    ) -> List[Dict]:
+        """
+        Force Stage-D product_model to come from Stage-C models of the same (brand, series) pair.
+        """
+        if not products:
+            return []
+        if not self.config.get("product_model_must_from_stage_c", True):
+            return products
+
+        known = _dedup_list(
+            [
+                _canonicalize_model_name(m)
+                for m in (known_models or [])
+                if _canonicalize_model_name(m)
+            ]
+        )
+        if not known:
+            return products
+
+        norm_to_known: Dict[str, str] = {}
+        for name in known:
+            key = _normalize_model_key(name)
+            if key and key not in norm_to_known:
+                norm_to_known[key] = name
+        if not norm_to_known:
+            return products
+
+        sorted_norm_keys = sorted(norm_to_known.keys(), key=len, reverse=True)
+        drop_if_unknown = bool(self.config.get("product_model_drop_if_unknown", True))
+        expand_multi = bool(self.config.get("product_model_expand_multi_match", True))
+        match_in_evidence = bool(self.config.get("product_model_match_in_evidence", True))
+        multi_cap = max(1, int(self.config.get("product_model_multi_match_cap", 12)))
+
+        def _match(text: str) -> List[str]:
+            normalized = _normalize_model_key(text or "")
+            if not normalized:
+                return []
+            if normalized in norm_to_known:
+                return [norm_to_known[normalized]]
+            hits = [norm_to_known[k] for k in sorted_norm_keys if k and k in normalized]
+            return _dedup_list(hits)
+
+        bound: List[Dict] = []
+        dropped = 0
+        expanded = 0
+        for product in products:
+            matches = _match(product.get("product_model", ""))
+            if not matches and match_in_evidence:
+                evidence_text = " ".join(str(x) for x in (product.get("evidence") or []))
+                fact_text = " ".join(str(x) for x in (product.get("fact_text") or []))
+                for probe in (evidence_text, fact_text):
+                    matches = _match(probe)
+                    if matches:
+                        break
+
+            if not matches:
+                if drop_if_unknown:
+                    dropped += 1
+                    continue
+                bound.append(product)
+                continue
+
+            if len(matches) > multi_cap:
+                matches = matches[:multi_cap]
+
+            if len(matches) > 1 and expand_multi:
+                expanded += len(matches) - 1
+                for model_name in matches:
+                    cloned = dict(product)
+                    cloned["product_model"] = model_name
+                    bound.append(cloned)
+            else:
+                canonical = dict(product)
+                canonical["product_model"] = matches[0]
+                bound.append(canonical)
+
+        if dropped or expanded:
+            self.logger.info(
+                "Stage D model binding brand=%s series=%s: in=%s out=%s dropped_unknown=%s expanded=%s known=%s",
+                brand,
+                series,
+                len(products),
+                len(bound),
+                dropped,
+                expanded,
+                len(known),
+            )
+        return bound
 
     async def _review_models_llm(
         self,
@@ -1422,10 +1639,40 @@ class StagedRelationExtractor:
             )
             verdicts = {item.get("name", "").strip(): item for item in result.get("items", [])}
             reviewed: List[Dict] = []
+            alias_map = getattr(self, "series_alias_map", {})
+            allow_redirect = bool(self.config.get("model_review_redirect", True))
+            drop_mismatch = bool(self.config.get("model_review_drop_mismatch", False))
+            redirect_conf = float(self.config.get("model_redirect_min_conf", 0.5))
             for cand in payload:
                 name = (cand.get("name") or "").strip()
                 decision = verdicts.get(name)
                 if decision and decision.get("keep") and decision.get("kind") == "model":
+                    series_guess = (decision.get("series_guess") or "").strip()
+                    redirect_to = (decision.get("redirect_to") or "").strip()
+                    conf = float(decision.get("confidence", 1.0) or 0)
+                    target_series = None
+                    if redirect_to:
+                        target_series = _match_series_name(redirect_to, brand, alias_map) or redirect_to
+                    elif series_guess:
+                        target_series = _match_series_name(series_guess, brand, alias_map)
+                        if not target_series and _normalize_series_key(series_guess) == _normalize_series_key(series):
+                            target_series = series
+                    if target_series and _normalize_series_key(target_series) != _normalize_series_key(series):
+                        if allow_redirect and conf >= redirect_conf:
+                            self.model_redirects.append(
+                                {
+                                    "brand": brand,
+                                    "source_series": series,
+                                    "target_series": target_series,
+                                    "model": cand,
+                                }
+                            )
+                            continue
+                        if drop_mismatch:
+                            continue
+                    elif not target_series and (redirect_to or series_guess) and drop_mismatch:
+                        # series hinted but cannot map confidently -> drop to avoid wrong assignment
+                        continue
                     reviewed.append(cand)
             # fallback: avoid empty due to over-prune
             return reviewed or candidates
@@ -1440,6 +1687,7 @@ class StagedRelationExtractor:
         pages: Sequence[Tuple[str, Dict]],
         error_log: Path,
     ) -> Tuple[Dict[str, List[Dict]], Dict[str, List]]:
+        self.model_redirects = []
         models_by_pair: Dict[str, List[Dict]] = {}
         pairs: List[Tuple[str, str, List]] = []
         for brand, series_list in brand_to_series.items():
@@ -1501,7 +1749,7 @@ class StagedRelationExtractor:
                         series_name,
                     )
                     return _pair_key(brand, series_name), []
-                text_block = _combine_pages(relevant_pages)
+                text_block = _combine_pages(relevant_pages, self.config)
                 pair_models = await self._extract_models_for_pair(
                     brand,
                     series_name,
@@ -1546,6 +1794,16 @@ class StagedRelationExtractor:
         if pbar:
             pbar.close()
 
+        # Redirect models to other series based on LLM series_guess signals.
+        if self.model_redirects:
+            for item in self.model_redirects:
+                dest_key = _pair_key(item["brand"], item["target_series"])
+                existing = models_by_pair.get(dest_key, [])
+                existing.append(item["model"])
+                models_by_pair[dest_key] = _merge_model_candidates(existing)
+            self.logger.info("Model redirects applied: %s", len(self.model_redirects))
+            self.model_redirects = []
+
         all_model_names: List[str] = []
         for model_list in models_by_pair.values():
             all_model_names.extend([(m.get("name") or "").strip() for m in model_list if m.get("name")])
@@ -1577,6 +1835,7 @@ class StagedRelationExtractor:
                 else:
                     model_item["pages"] = _dedup_list(model_item.get("pages", []))
 
+        models_by_pair = _enrich_models_by_pair(models_by_pair)
         return models_by_pair, model_page_stats
 
     # -------------------------- Stage D: products -------------------------- #
@@ -1588,6 +1847,7 @@ class StagedRelationExtractor:
         page_refs: List,
         known_models: Optional[List[str]],
         error_log: Path,
+        target_model: Optional[str] = None,
     ) -> List[Dict]:
         chunk_pbar = None
         try:
@@ -1596,6 +1856,8 @@ class StagedRelationExtractor:
             chunk_sem = asyncio.Semaphore(_get_concurrency(self.config, "product_chunk_concurrency", 8))
             if getattr(self, "_show_progress", False):
                 pair_label = f"{(brand or 'unknown')[:10]}/{(series or 'all')[:12]}"
+                if target_model:
+                    pair_label = f"{pair_label}/{target_model[:14]}"
                 chunk_pbar = tqdm(
                     total=len(chunks),
                     desc=f"Stage D chunks[{pair_label}]",
@@ -1607,7 +1869,13 @@ class StagedRelationExtractor:
                 try:
                     async with chunk_sem:
                         payload = await self._acall(
-                            build_product_messages(brand, series, chunk_text, known_models=known_models),
+                            build_product_messages(
+                                brand,
+                                series,
+                                chunk_text,
+                                known_models=known_models,
+                                target_model=target_model,
+                            ),
                             PRODUCT_SCHEMA,
                             "product_schema",
                             {
@@ -1651,7 +1919,25 @@ class StagedRelationExtractor:
                     )
                     chunk_pbar.update(1)
                 for item in chunk_results:
-                    products.append(self._ensure_product_defaults(item, brand, series, page_refs))
+                    merged = self._ensure_product_defaults(item, brand, series, page_refs)
+                    # Stage-D hierarchy identity must inherit from upstream stages.
+                    if brand:
+                        merged["brand"] = str(brand).strip()
+                    if series:
+                        merged["series"] = str(series).strip()
+                    if target_model:
+                        merged["product_model"] = _canonicalize_model_name(target_model)
+                    products.append(merged)
+
+            # Merge across chunks for the same target model to form one coherent product output.
+            if target_model:
+                products = self._bind_products_to_known_models(
+                    brand,
+                    series,
+                    products,
+                    [target_model],
+                )
+            products = _deduplicate_products_by_model(products, self.config)
             return products
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "product_extract", {"brand": brand, "series": series}, exc)
@@ -1688,7 +1974,7 @@ class StagedRelationExtractor:
 
         pair_limit = max(1, _get_concurrency(self.config, "product_pair_concurrency", 6))
         pair_sem = asyncio.Semaphore(pair_limit)
-        self.logger.info("Stage C pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
+        self.logger.info("Stage D pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
 
         async def _run_pair(
             pair_index: int,
@@ -1701,11 +1987,89 @@ class StagedRelationExtractor:
                 pair_models = self.models_by_pair.get(_pair_key(brand, series_name), [])
                 if self.enable_model_stage and not pair_models:
                     return pair_index, []
-                known_models = [
-                    _canonicalize_model_name(model_item.get("name") or "")
-                    for model_item in pair_models
-                    if _canonicalize_model_name(model_item.get("name") or "")
-                ]
+                known_models = _dedup_list(
+                    [
+                        _canonicalize_model_name(model_item.get("name") or "")
+                        for model_item in pair_models
+                        if _canonicalize_model_name(model_item.get("name") or "")
+                    ]
+                )
+                follow_after = int(self.config.get("model_context_follow_pages", 2))
+                use_target_mode = bool(self.config.get("stage_d_target_model_mode", True))
+
+                if use_target_mode and known_models:
+                    model_to_pages: Dict[str, List] = {}
+                    for model_item in pair_models:
+                        model_name = _canonicalize_model_name(model_item.get("name") or "")
+                        if not model_name:
+                            continue
+                        pages_hit = model_to_pages.setdefault(model_name, [])
+                        pages_hit.extend(self.model_page_stats.get(model_name, []))
+                        pages_hit.extend(model_item.get("pages", []))
+                    for model_name in list(model_to_pages.keys()):
+                        model_to_pages[model_name] = _dedup_list(
+                            [p for p in model_to_pages[model_name] if p is not None and str(p) != ""]
+                        )
+
+                    model_sem = asyncio.Semaphore(
+                        max(1, _get_concurrency(self.config, "product_model_concurrency", 6))
+                    )
+
+                    async def _run_model(model_name: str) -> List[Dict]:
+                        async with model_sem:
+                            model_pages = model_to_pages.get(model_name, [])
+                            if not model_pages and series_pages:
+                                model_pages = _dedup_list(series_pages)
+                            if not model_pages:
+                                return []
+                            model_relevant_pages = _select_pages_by_numbers_with_following(
+                                pages,
+                                model_pages,
+                                follow_after=follow_after,
+                            )
+                            if not model_relevant_pages:
+                                return []
+                            text_block = _combine_pages(model_relevant_pages, self.config)
+                            page_refs = [meta.get("page") for _, meta in model_relevant_pages]
+                            extracted = await self._extract_products_for_pair(
+                                brand,
+                                series_name,
+                                text_block,
+                                page_refs,
+                                [model_name],
+                                error_log,
+                                target_model=model_name,
+                            )
+                            processed_model = list(extracted)
+                            if self.config.get("enable_product_llm_review", True) and processed_model:
+                                processed_model = await self._review_products_llm(
+                                    brand,
+                                    series_name,
+                                    processed_model,
+                                    error_log,
+                                )
+                            processed_model = self._bind_products_to_known_models(
+                                brand,
+                                series_name,
+                                processed_model,
+                                [model_name],
+                            )
+                            return _deduplicate_products_by_model(processed_model, self.config)
+
+                    model_tasks = [asyncio.create_task(_run_model(model_name)) for model_name in known_models]
+                    model_products: List[Dict] = []
+                    for mt in asyncio.as_completed(model_tasks):
+                        model_products.extend(await mt)
+                    model_products = _deduplicate_products_by_model(model_products, self.config)
+                    model_products = self._bind_products_to_known_models(
+                        brand,
+                        series_name,
+                        model_products,
+                        known_models,
+                    )
+                    return pair_index, model_products
+
+                # Fallback legacy pair-level extraction path.
                 model_hit_pages: List = []
                 for model_name in known_models:
                     model_hit_pages.extend(self.model_page_stats.get(model_name, []))
@@ -1715,7 +2079,6 @@ class StagedRelationExtractor:
                 if not model_hit_pages and series_pages:
                     model_hit_pages.extend(series_pages)
 
-                follow_after = int(self.config.get("model_context_follow_pages", 2))
                 relevant_pages = _select_pages_by_numbers_with_following(
                     pages,
                     _dedup_list(model_hit_pages),
@@ -1734,7 +2097,7 @@ class StagedRelationExtractor:
                         series_name,
                     )
                     return pair_index, []
-                text_block = _combine_pages(relevant_pages)
+                text_block = _combine_pages(relevant_pages, self.config)
                 page_refs = [meta.get("page") for _, meta in relevant_pages]
                 extracted = await self._extract_products_for_pair(
                     brand,
@@ -1743,6 +2106,7 @@ class StagedRelationExtractor:
                     page_refs,
                     known_models,
                     error_log,
+                    target_model=None,
                 )
                 processed = list(extracted)
                 if self.config.get("enable_product_llm_review", True) and processed:
@@ -1752,6 +2116,12 @@ class StagedRelationExtractor:
                         processed,
                         error_log,
                     )
+                processed = self._bind_products_to_known_models(
+                    brand,
+                    series_name,
+                    processed,
+                    known_models,
+                )
                 return pair_index, processed
             except Exception as exc:  # noqa: BLE001
                 _append_error(
@@ -1876,76 +2246,92 @@ class StagedRelationExtractor:
 
 
 def _select_pages_by_keywords(
-    pages: Sequence[Tuple[str, Dict]], keywords: Sequence[str]
+    pages: Sequence[Tuple[str, Dict]],
+    keywords: Sequence[str],
+    top_k: int = 0,
+    min_hits: int = 1,
+    match_mode: str = "any",
 ) -> List[Tuple[str, Dict]]:
-    """Legacy keyword filter (kept as fallback)."""
-    lowered = [k.lower() for k in keywords if k]
+    """Keyword retrieval with hit-count ranking; fallback to all pages when no match."""
+    lowered = _dedup_list([str(k).strip().lower() for k in keywords if str(k).strip()])
     if not lowered:
         return list(pages)
-    selected = []
-    for text, meta in pages:
-        text_lower = text.lower()
-        if all(k in text_lower for k in lowered):
-            selected.append((text, meta))
-    return selected or list(pages)
 
+    mode = str(match_mode or "any").strip().lower()
+    required_hits = max(1, int(min_hits))
+    ranked: List[Tuple[int, int, Tuple[str, Dict]]] = []
 
-def _retrieve_pages_by_embedding(
-    pages: Sequence[Tuple[str, Dict]],
-    query: str,
-    model_name: str,
-    device: str,
-    top_k: int,
-    min_sim: float = 0.1,
-) -> List[Tuple[str, Dict]]:
-    if not query.strip():
-        return list(pages)
-    try:
-        page_texts = [text for text, _ in pages]
-        page_vecs = _embed_texts(page_texts, model_name, device=device)
-        q_vec = _embed_texts([query], model_name, device=device)[0]
-    except Exception:
-        return []
-    sims = np.dot(page_vecs, q_vec)
-    ranked = [
-        (sim, idx) for idx, sim in enumerate(sims) if sim >= min_sim
-    ]
-    ranked.sort(reverse=True, key=lambda x: x[0])
+    for idx, page in enumerate(pages):
+        text = str(page[0] or "").lower()
+        hit_count = sum(1 for kw in lowered if kw in text)
+        if mode == "all":
+            is_match = hit_count == len(lowered)
+        else:
+            is_match = hit_count >= required_hits
+        if is_match:
+            ranked.append((hit_count, idx, page))
+
     if not ranked:
-        return []
-    keep = ranked[:top_k]
-    return [pages[idx] for _, idx in keep]
+        return list(pages)
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = [page for _, _, page in ranked]
+    if int(top_k) > 0:
+        selected = selected[: int(top_k)]
+    return selected
 
 
-def _retrieve_pages_by_bm25(
-    pages: Sequence[Tuple[str, Dict]],
-    query: str,
-    top_k: int,
-) -> List[Tuple[str, Dict]]:
-    if not query.strip() or BM25Okapi is None:
-        return []
-    corpus = [text for text, _ in pages]
-    tokenized_corpus = [c.split() for c in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
-    scores = bm25.get_scores(query.split())
-    ranked = sorted([(s, idx) for idx, s in enumerate(scores)], reverse=True, key=lambda x: x[0])
-    ranked = [(s, i) for s, i in ranked if s > 0]
-    return [pages[idx] for _, idx in ranked[:top_k]]
+def _render_rows_blocks(rows, config: Optional[Dict]) -> List[str]:
+    try:
+        rows_list = list(rows) if isinstance(rows, (list, tuple)) else [rows]
+    except Exception:
+        rows_list = [rows]
+    rows_per_block = max(1, int(config.get("table_rows_per_block", 10))) if config else 10
+    max_cell_len = int(config.get("table_row_cell_clip", 0)) if config else 0
+    blocks: List[str] = []
+    for i in range(0, len(rows_list), rows_per_block):
+        block_rows = rows_list[i : i + rows_per_block]
+        rendered = []
+        for r in block_rows:
+            try:
+                row_str = json.dumps(r, ensure_ascii=False)
+            except Exception:
+                row_str = str(r)
+            if max_cell_len and len(row_str) > max_cell_len:
+                row_str = row_str[:max_cell_len] + "..."
+            rendered.append(row_str)
+        if rendered:
+            blocks.append("\n".join(rendered))
+    return blocks
 
 
-def _combine_pages(pages: Sequence[Tuple[str, Dict]]) -> str:
+def _combine_pages(pages: Sequence[Tuple[str, Dict]], config: Optional[Dict] = None) -> str:
     chunks = []
     for text, meta in pages:
         page = meta.get("page", "")
         chunk = [f"<<PAGE {page}>>", text]
         rows = meta.get("rows")
         if rows:
-            try:
-                # keep raw rows to preserve table/bbox evidence for LLM
+            row_blocks: List[str] = []
+            if config and config.get("table_row_exhaust_mode", False):
+                row_blocks = _render_rows_blocks(rows, config)
+            else:
+                try:
+                    clip_chars = (
+                        int(config.get("table_rows_clip_chars", 4000)) if config else 4000
+                    )
+                except Exception:
+                    clip_chars = 4000
+                try:
+                    raw_rows = json.dumps(rows, ensure_ascii=False)
+                    if clip_chars and clip_chars > 0:
+                        raw_rows = raw_rows[:clip_chars]
+                    row_blocks = [raw_rows]
+                except Exception:
+                    row_blocks = []
+            for block in row_blocks:
                 chunk.append("[rows_json]")
-                chunk.append(json.dumps(rows, ensure_ascii=False)[:4000])
-            except Exception:
-                pass
+                chunk.append(block)
         chunks.append("\n".join(chunk))
     return "\n\n".join(chunks)
 
@@ -2190,7 +2576,160 @@ def _canonicalize_models_by_pair(models_by_pair: Dict[str, List[Dict]]) -> Dict[
             cloned["name"] = _canonicalize_model_name(cloned.get("name") or "")
             items.append(cloned)
         out[pair_key] = _merge_model_candidates(items)
+    return _enrich_models_by_pair(out)
+
+
+def _enrich_series_by_brand(brand_to_series: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:
+    out: Dict[str, List[Dict]] = {}
+    for brand, series_list in (brand_to_series or {}).items():
+        enriched: List[Dict] = []
+        for item in series_list or []:
+            entry = dict(item or {})
+            series_name = (entry.get("name") or "").strip()
+            if not series_name:
+                continue
+            entry["name"] = series_name
+            entry["brand"] = brand
+            entry["pair_key"] = _pair_key(brand, series_name)
+            entry["series_key"] = _normalize_series_key(series_name)
+            entry["evidence"] = _dedup_list(entry.get("evidence", []))
+            entry["pages"] = _dedup_list(entry.get("pages", []))
+            enriched.append(entry)
+        out[brand] = enriched
     return out
+
+
+def _enrich_models_by_pair(models_by_pair: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:
+    out: Dict[str, List[Dict]] = {}
+    for pair_key, model_list in (models_by_pair or {}).items():
+        brand, series = _split_pair_key(pair_key)
+        enriched: List[Dict] = []
+        for item in model_list or []:
+            entry = dict(item or {})
+            model_name = _canonicalize_model_name(entry.get("name") or "")
+            if not model_name:
+                continue
+            entry["name"] = model_name
+            entry["brand"] = brand
+            entry["series"] = series
+            entry["pair_key"] = pair_key
+            entry["model_key"] = _model_node_key(brand, series, model_name)
+            entry["evidence"] = _dedup_list(entry.get("evidence", []))
+            entry["pages"] = _dedup_list(entry.get("pages", []))
+            enriched.append(entry)
+        out[pair_key] = _merge_model_candidates(enriched)
+    return out
+
+
+def _build_brand_series_relations(
+    brands: Sequence[Dict],
+    brand_to_series: Dict[str, List[Dict]],
+) -> List[Dict]:
+    brand_pages: Dict[str, List] = {}
+    for item in brands or []:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        brand_pages[name] = _dedup_list(item.get("pages", []))
+
+    edges: List[Dict] = []
+    for brand, series_list in (brand_to_series or {}).items():
+        for series_item in series_list or []:
+            series_name = (series_item.get("name") or "").strip()
+            if not series_name:
+                continue
+            edges.append(
+                {
+                    "brand": brand,
+                    "brand_key": _normalize_brand_key(brand),
+                    "brand_pages": brand_pages.get(brand, []),
+                    "series": series_name,
+                    "series_key": _normalize_series_key(series_name),
+                    "pair_key": _pair_key(brand, series_name),
+                    "evidence": _dedup_list(series_item.get("evidence", [])),
+                    "pages": _dedup_list(series_item.get("pages", [])),
+                }
+            )
+    return edges
+
+
+def _build_series_model_relations(models_by_pair: Dict[str, List[Dict]]) -> List[Dict]:
+    edges: List[Dict] = []
+    for pair_key, model_list in (models_by_pair or {}).items():
+        brand, series = _split_pair_key(pair_key)
+        for model_item in model_list or []:
+            model_name = _canonicalize_model_name(model_item.get("name") or "")
+            if not model_name:
+                continue
+            edges.append(
+                {
+                    "brand": brand,
+                    "series": series,
+                    "pair_key": pair_key,
+                    "model_name": model_name,
+                    "model_key": _model_node_key(brand, series, model_name),
+                    "evidence": _dedup_list(model_item.get("evidence", [])),
+                    "pages": _dedup_list(model_item.get("pages", [])),
+                }
+            )
+    return edges
+
+
+def _models_explicit_view(models_by_pair: Dict[str, List[Dict]]) -> List[Dict]:
+    rows: List[Dict] = []
+    for pair_key, model_list in (models_by_pair or {}).items():
+        for model_item in model_list or []:
+            rows.append(dict(model_item or {}, pair_key=pair_key))
+    return rows
+
+
+def _build_model_specs_relations(products: Sequence[Dict]) -> List[Dict]:
+    grouped: Dict[str, Dict] = {}
+    for product in products or []:
+        brand = (product.get("brand") or "").strip()
+        series = (product.get("series") or "").strip()
+        model_name = _canonicalize_model_name(product.get("product_model") or "")
+        if not model_name:
+            continue
+        model_key = _model_node_key(brand, series, model_name)
+        entry = grouped.get(model_key)
+        if entry is None:
+            entry = {
+                "brand": brand,
+                "series": series,
+                "pair_key": _pair_key(brand, series),
+                "model_name": model_name,
+                "model_key": model_key,
+                "manufacturer": str(product.get("manufacturer") or "").strip(),
+                "refrigerant": str(product.get("refrigerant") or "").strip(),
+                "energy_efficiency_grade": str(product.get("energy_efficiency_grade") or "").strip(),
+                "performance_specs": [],
+                "evidence": [],
+                "fact_text": [],
+            }
+            grouped[model_key] = entry
+
+        entry["evidence"] = _dedup_list(entry.get("evidence", []) + (product.get("evidence") or []))
+        entry["fact_text"] = _dedup_list(entry.get("fact_text", []) + (product.get("fact_text") or []))
+        for spec in product.get("performance_specs") or []:
+            key = (
+                (spec.get("name") or "").strip(),
+                (spec.get("value") or "").strip(),
+                (spec.get("unit") or "").strip(),
+            )
+            if key == ("", "", ""):
+                continue
+            existing = {
+                (
+                    (s.get("name") or "").strip(),
+                    (s.get("value") or "").strip(),
+                    (s.get("unit") or "").strip(),
+                )
+                for s in entry["performance_specs"]
+            }
+            if key not in existing:
+                entry["performance_specs"].append(spec)
+    return list(grouped.values())
 
 
 def _normalize_spec_key(name: str) -> str:
@@ -2332,9 +2871,14 @@ def extract_relations_multistage(
     brand_alias_file = stage_dir / "brand_aliases.json"
     series_file = stage_dir / "series.json"
     series_alias_file = stage_dir / "series_aliases.json"
+    series_features_file = stage_dir / "series_features.json"
     models_file = stage_dir / "models.json"
+    models_explicit_file = stage_dir / "models_explicit.json"
     model_pages_file = stage_dir / "model_pages.json"
     model_conflicts_file = stage_dir / "model_conflicts.json"
+    brand_series_rel_file = stage_dir / "brand_series_relations.json"
+    series_model_rel_file = stage_dir / "series_model_relations.json"
+    model_specs_rel_file = stage_dir / "model_specs_relations.json"
     products_file = stage_dir / "products_raw.json"
     force_rerun = cfg.get("force_stage_rerun", False)
 
@@ -2368,6 +2912,7 @@ def extract_relations_multistage(
                     json.dumps(extractor.series_alias_map, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+        brand_to_series = _enrich_series_by_brand(brand_to_series)
 
         # Stage C: models
         if models_file.exists() and not force_rerun:
@@ -2393,13 +2938,43 @@ def extract_relations_multistage(
                     json.dumps(extractor.model_conflicts, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+        extractor.models_by_pair = _enrich_models_by_pair(extractor.models_by_pair)
 
         # Stage D: products
         if products_file.exists() and not force_rerun:
             products = json.loads(products_file.read_text(encoding="utf-8"))
+            if series_features_file.exists():
+                extractor.series_feature_map = json.loads(series_features_file.read_text(encoding="utf-8"))
         else:
             products = await extractor.run_product_stage(brand_to_series, pages, error_log_path)
             products_file.write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding="utf-8")
+            if extractor.series_feature_map:
+                series_features_file.write_text(
+                    json.dumps(extractor.series_feature_map, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+        # Hierarchy relation views (always refresh to keep caches consistent).
+        brand_series_relations = _build_brand_series_relations(brands, brand_to_series)
+        series_model_relations = _build_series_model_relations(extractor.models_by_pair)
+        model_specs_relations = _build_model_specs_relations(products)
+        models_explicit = _models_explicit_view(extractor.models_by_pair)
+        brand_series_rel_file.write_text(
+            json.dumps(brand_series_relations, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        series_model_rel_file.write_text(
+            json.dumps(series_model_relations, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        model_specs_rel_file.write_text(
+            json.dumps(model_specs_relations, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        models_explicit_file.write_text(
+            json.dumps(models_explicit, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         if not products:
             extractor.logger.warning("No products extracted; emitting doc-level fallback.")
