@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from openai import AsyncOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -26,6 +27,10 @@ from LLMRelationExtracter import (  # v1 复用的通用模块
     deduplicate_results,
     filter_empty_products,
     load_pages_with_context,
+)
+from LLMRelationExtracter.md_processor import (
+    load_pages_with_context_from_md,
+    load_pages_with_context_from_md_directory,
 )
 from sklearn.cluster import AgglomerativeClustering
 from .staged_prompts import (
@@ -37,17 +42,20 @@ from .staged_prompts import (
     PRODUCT_REVIEW_SCHEMA,
     PRODUCT_SCHEMA,
     SERIES_CANON_SCHEMA,
+    SERIES_FEATURE_SCHEMA,
     SERIES_SCHEMA,
     SERIES_REVIEW_SCHEMA,
     build_brand_canon_messages,
     build_brand_filter_messages,
     build_brand_global_filter_messages,
+    build_brand_primary_messages,
     build_brand_messages,
     build_model_messages,
     build_model_review_messages,
     build_product_messages,
     build_product_review_messages,
     build_series_canon_messages,
+    build_series_feature_messages,
     build_series_review_messages,
     build_series_messages,
 )
@@ -58,10 +66,31 @@ from .staged_prompts import (
 # --------------------------------------------------------------------------- #
 
 def load_pages_with_context_v2(
-    csv_path: str, window_size: int = 1, known_models: Optional[List[str]] = None
+    source_path: str, window_size: int = 1, known_models: Optional[List[str]] = None
 ) -> Iterable[Tuple[str, Dict]]:
-    """Alias for v1 loader to保持 I/O 一致。"""
-    yield from load_pages_with_context(csv_path, window_size=window_size, known_models=known_models)
+    """Load pages from CSV, Markdown file, or Markdown directory."""
+    path = Path(source_path)
+    if path.is_dir():
+        yield from load_pages_with_context_from_md_directory(
+            source_path,
+            window_size=window_size,
+            known_models=known_models,
+        )
+        return
+
+    if path.suffix.lower() == ".md":
+        yield from load_pages_with_context_from_md(
+            source_path,
+            window_size=window_size,
+            known_models=known_models,
+        )
+        return
+
+    yield from load_pages_with_context(
+        source_path,
+        window_size=window_size,
+        known_models=known_models,
+    )
 
 
 def _normalize_name(text: str) -> str:
@@ -875,6 +904,324 @@ def _append_error(error_log: Path, stage: str, meta: Dict, exc: Exception) -> No
         )
 
 
+def _snapshot_brand_candidates(brands: Sequence[Dict]) -> List[Dict]:
+    merged: Dict[str, Dict] = {}
+    for item in brands or []:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        key = _normalize_brand_key(name) or _normalize_name(name)
+        if not key:
+            continue
+        bucket = merged.setdefault(
+            key,
+            {
+                "name": name,
+                "evidence": [],
+                "pages": [],
+            },
+        )
+        bucket["evidence"].extend(item.get("evidence", []))
+        bucket["pages"].extend(item.get("pages", []))
+        if len(_dedup_list(item.get("pages", []))) > len(_dedup_list(bucket.get("pages", []))):
+            bucket["name"] = name
+
+    snapshots: List[Dict] = []
+    for bucket in merged.values():
+        snapshots.append(
+            {
+                "name": bucket.get("name", ""),
+                "evidence": _dedup_list(bucket.get("evidence", [])),
+                "pages": _dedup_list(bucket.get("pages", [])),
+            }
+        )
+    snapshots.sort(key=lambda x: len(_dedup_list(x.get("pages", []))), reverse=True)
+    return snapshots
+
+
+def _build_dropped_brand_cache(
+    all_candidates: Sequence[Dict],
+    kept_brands: Sequence[Dict],
+    brand_alias_map: Dict[str, List[str]],
+) -> List[Dict]:
+    keep_keys = set()
+    for item in kept_brands or []:
+        key = _normalize_brand_key(item.get("name", ""))
+        if key:
+            keep_keys.add(key)
+    for canonical, aliases in (brand_alias_map or {}).items():
+        canonical_key = _normalize_brand_key(canonical)
+        if canonical_key:
+            keep_keys.add(canonical_key)
+        for alias in aliases or []:
+            alias_key = _normalize_brand_key(alias)
+            if alias_key:
+                keep_keys.add(alias_key)
+
+    primary_brand = ""
+    if len(kept_brands or []) == 1:
+        primary_brand = str((kept_brands or [])[0].get("name") or "").strip()
+
+    dropped: List[Dict] = []
+    for item in _snapshot_brand_candidates(all_candidates):
+        key = _normalize_brand_key(item.get("name", ""))
+        if key and key in keep_keys:
+            continue
+        dropped.append(
+            {
+                "name": item.get("name", ""),
+                "evidence": _dedup_list(item.get("evidence", [])),
+                "pages": _dedup_list(item.get("pages", [])),
+                "drop_reason": "not_selected_in_stage_a_final_brands",
+                "selected_primary_brand": primary_brand,
+            }
+        )
+    return dropped
+
+
+def _enforce_single_brand_series_scope(
+    brands: Sequence[Dict],
+    brand_to_series: Dict[str, List[Dict]],
+    series_alias_map: Optional[Dict[str, Dict[str, List[str]]]] = None,
+) -> Tuple[Dict[str, List[Dict]], Dict[str, Dict[str, List[str]]], bool]:
+    normalized_series = _enrich_series_by_brand(brand_to_series)
+    alias_map = dict(series_alias_map or {})
+    if len(brands or []) != 1:
+        return normalized_series, alias_map, False
+
+    primary_brand = str((brands or [])[0].get("name") or "").strip()
+    if not primary_brand:
+        return normalized_series, alias_map, False
+
+    changed = set(normalized_series.keys()) != {primary_brand}
+    flattened: List[Dict] = []
+    for brand, series_list in normalized_series.items():
+        if brand != primary_brand:
+            changed = True
+        for series_item in series_list or []:
+            entry = dict(series_item or {})
+            series_name = (entry.get("name") or "").strip()
+            if not series_name:
+                continue
+            if str(entry.get("brand") or "").strip() != primary_brand:
+                changed = True
+            entry["name"] = series_name
+            entry["brand"] = primary_brand
+            entry["pair_key"] = _pair_key(primary_brand, series_name)
+            entry["series_key"] = _normalize_series_key(series_name)
+            entry["evidence"] = _dedup_list(entry.get("evidence", []))
+            entry["pages"] = _dedup_list(entry.get("pages", []))
+            flattened.append(entry)
+
+    if not flattened:
+        collapsed_series = {primary_brand: []}
+    else:
+        merged_series = _merge_series_candidates(flattened)
+        grouped: Dict[str, Dict] = {}
+        for item in merged_series:
+            series_name = (item.get("name") or "").strip()
+            if not series_name:
+                continue
+            key = _normalize_series_key(series_name) or _normalize_name(series_name)
+            bucket = grouped.get(key)
+            if bucket is None:
+                grouped[key] = dict(item)
+                continue
+            bucket["name"] = (
+                _choose_series_canonical_name([bucket.get("name", ""), series_name])
+                or bucket.get("name", "")
+            )
+            bucket["evidence"] = _dedup_list(bucket.get("evidence", []) + item.get("evidence", []))
+            bucket["pages"] = _dedup_list(bucket.get("pages", []) + item.get("pages", []))
+        collapsed_series = {primary_brand: list(grouped.values())}
+
+    alias_grouped: Dict[str, List[str]] = {}
+    for brand, mapping in alias_map.items():
+        if brand != primary_brand and mapping:
+            changed = True
+        if not isinstance(mapping, dict):
+            continue
+        for canonical, aliases in mapping.items():
+            canonical_name = str(canonical or "").strip()
+            if not canonical_name:
+                continue
+            key = _normalize_series_key(canonical_name) or _normalize_name(canonical_name)
+            slot = alias_grouped.setdefault(key, [])
+            slot.append(canonical_name)
+            for alias in aliases or []:
+                alias_name = str(alias or "").strip()
+                if alias_name:
+                    slot.append(alias_name)
+
+    collapsed_alias_inner: Dict[str, List[str]] = {}
+    for series_item in collapsed_series.get(primary_brand, []):
+        series_name = str(series_item.get("name") or "").strip()
+        if not series_name:
+            continue
+        key = _normalize_series_key(series_name) or _normalize_name(series_name)
+        aliases = _dedup_list(alias_grouped.get(key, []) + [series_name])
+        collapsed_alias_inner[series_name] = aliases
+
+    collapsed_alias_map = {primary_brand: collapsed_alias_inner}
+    if alias_map != collapsed_alias_map:
+        changed = True
+
+    return collapsed_series, collapsed_alias_map, changed
+
+
+def _enforce_single_brand_models_scope(
+    brands: Sequence[Dict],
+    models_by_pair: Dict[str, List[Dict]],
+) -> Tuple[Dict[str, List[Dict]], bool]:
+    normalized_models = _enrich_models_by_pair(models_by_pair)
+    if len(brands or []) != 1:
+        return normalized_models, False
+
+    primary_brand = str((brands or [])[0].get("name") or "").strip()
+    if not primary_brand:
+        return normalized_models, False
+
+    changed = False
+    collapsed: Dict[str, List[Dict]] = {}
+    for pair_key, model_list in normalized_models.items():
+        _, series_name = _split_pair_key(pair_key)
+        target_pair_key = _pair_key(primary_brand, series_name)
+        if pair_key != target_pair_key:
+            changed = True
+        bucket = collapsed.setdefault(target_pair_key, [])
+        for model_item in model_list or []:
+            entry = dict(model_item or {})
+            model_name = _canonicalize_model_name(entry.get("name") or "")
+            if not model_name:
+                continue
+            if str(entry.get("brand") or "").strip() != primary_brand:
+                changed = True
+            entry["name"] = model_name
+            entry["brand"] = primary_brand
+            entry["series"] = series_name
+            entry["pair_key"] = target_pair_key
+            entry["model_key"] = _model_node_key(primary_brand, series_name, model_name)
+            entry["evidence"] = _dedup_list(entry.get("evidence", []))
+            entry["pages"] = _dedup_list(entry.get("pages", []))
+            bucket.append(entry)
+
+    for pair_key in list(collapsed.keys()):
+        collapsed[pair_key] = _merge_model_candidates(collapsed[pair_key])
+
+    return _enrich_models_by_pair(collapsed), changed
+
+
+def _remap_model_conflicts_to_single_brand(
+    brands: Sequence[Dict],
+    model_conflicts: Dict[str, Dict],
+) -> Tuple[Dict[str, Dict], bool]:
+    if len(brands or []) != 1:
+        return model_conflicts, False
+    if not model_conflicts:
+        return model_conflicts, False
+
+    primary_brand = str((brands or [])[0].get("name") or "").strip()
+    if not primary_brand:
+        return model_conflicts, False
+
+    changed = False
+    remapped: Dict[str, Dict] = {}
+    for conflict_id, payload in model_conflicts.items():
+        entry = dict(payload or {})
+        if str(entry.get("brand") or "").strip() != primary_brand:
+            changed = True
+        entry["brand"] = primary_brand
+
+        winner_pair_key = str(entry.get("winner_pair_key") or "")
+        if winner_pair_key:
+            _, winner_series = _split_pair_key(winner_pair_key)
+            winner_target = _pair_key(primary_brand, winner_series)
+            if winner_target != winner_pair_key:
+                changed = True
+            entry["winner_pair_key"] = winner_target
+
+        remapped_candidates: List[Dict] = []
+        for candidate in entry.get("candidates") or []:
+            cand = dict(candidate or {})
+            pair_key = str(cand.get("pair_key") or "")
+            if pair_key:
+                _, cand_series = _split_pair_key(pair_key)
+                target_pair_key = _pair_key(primary_brand, cand_series)
+                if target_pair_key != pair_key:
+                    changed = True
+                cand["pair_key"] = target_pair_key
+            remapped_candidates.append(cand)
+        entry["candidates"] = remapped_candidates
+
+        model_key = str(entry.get("model_key") or "")
+        target_conflict_id = f"{primary_brand}::{model_key}" if model_key else str(conflict_id)
+        if target_conflict_id != str(conflict_id):
+            changed = True
+        remapped[target_conflict_id] = entry
+
+    return remapped, changed
+
+
+def _enforce_single_brand_products_scope(
+    brands: Sequence[Dict],
+    products: Sequence[Dict],
+) -> Tuple[List[Dict], bool]:
+    if len(brands or []) != 1:
+        return list(products or []), False
+
+    primary_brand = str((brands or [])[0].get("name") or "").strip()
+    if not primary_brand:
+        return list(products or []), False
+
+    changed = False
+    normalized: List[Dict] = []
+    for product in products or []:
+        entry = dict(product or {})
+        if str(entry.get("brand") or "").strip() != primary_brand:
+            changed = True
+        entry["brand"] = primary_brand
+        normalized.append(entry)
+    return normalized, changed
+
+
+def _enforce_single_brand_series_feature_scope(
+    brands: Sequence[Dict],
+    series_feature_map: Dict[str, Dict[str, List[Dict]]],
+) -> Tuple[Dict[str, Dict[str, List[Dict]]], bool]:
+    if len(brands or []) != 1:
+        return series_feature_map, False
+
+    primary_brand = str((brands or [])[0].get("name") or "").strip()
+    if not primary_brand:
+        return series_feature_map, False
+
+    changed = False
+    collapsed: Dict[str, List[Dict]] = {}
+    for brand, series_map in (series_feature_map or {}).items():
+        if brand != primary_brand and series_map:
+            changed = True
+        for series_name, features in (series_map or {}).items():
+            bucket = collapsed.setdefault(series_name, [])
+            bucket.extend(features or [])
+
+    deduped: Dict[str, List[Dict]] = {}
+    for series_name, features in collapsed.items():
+        seen = set()
+        unique_features: List[Dict] = []
+        for feature in features or []:
+            key = json.dumps(feature or {}, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_features.append(feature)
+        deduped[series_name] = unique_features
+
+    result = {primary_brand: deduped}
+    if result != (series_feature_map or {}):
+        changed = True
+    return result, changed
+
+
 # --------------------------------------------------------------------------- #
 # Core extractor
 # --------------------------------------------------------------------------- #
@@ -886,16 +1233,21 @@ class StagedRelationExtractor:
         if config:
             self.config.update(config)
 
-        self.client = AsyncOpenAI(
-            api_key=self.config["api_key"], base_url=self.config["base_url"]
+        self.lc_llm = ChatOpenAI(
+            api_key=self.config["api_key"],
+            base_url=self.config["base_url"],
+            model=self.config["model"],
+            temperature=0,
+            timeout=self.config.get("timeout", 300),
         )
-        self.model = self.config["model"]
         self.semaphore = asyncio.Semaphore(_get_concurrency(self.config, "max_concurrent", 5))
-        self.timeout = self.config.get("timeout", 300)
         self.logger = self._setup_logger(log_name)
         self.brand_alias_map: Dict[str, List[str]] = {}
+        self.brand_candidates_all: List[Dict] = []
+        self.brand_dropped: List[Dict] = []
         self.series_alias_map: Dict[str, Dict[str, List[str]]] = {}
         self.series_feature_map: Dict[str, Dict[str, List[Dict]]] = {}
+        self.series_component_map: Dict[str, Dict[str, List[str]]] = {}
         self.models_by_pair: Dict[str, List[Dict]] = {}
         self.model_page_stats: Dict[str, List] = {}
         self.model_conflicts: Dict[str, Dict] = {}
@@ -950,17 +1302,52 @@ class StagedRelationExtractor:
         schema_name: str,
         metadata: Optional[Dict] = None,
     ) -> Dict:
+        return await self._acall_langchain(messages, schema, schema_name, metadata)
+
+    async def _acall_langchain(
+        self,
+        messages: List[Dict],
+        schema: Dict,
+        schema_name: str,
+        metadata: Optional[Dict] = None,
+    ) -> Dict:
+        del metadata
+
+        lc_messages = []
+        for msg in messages or []:
+            role = str((msg or {}).get("role") or "").strip().lower()
+            content = str((msg or {}).get("content") or "")
+            if role == "system":
+                lc_messages.append(SystemMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
+            else:
+                lc_messages.append(HumanMessage(content=content))
+
+        llm = self.lc_llm.bind(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": schema_name, "schema": schema, "strict": True},
+            }
+        )
         async with self.semaphore:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": schema_name, "schema": schema, "strict": True},
-                },
-                timeout=self.timeout,
-            )
-        content = (response.choices[0].message.content or "").strip()
+            response = await llm.ainvoke(lc_messages)
+
+        raw_content = getattr(response, "content", "")
+        if isinstance(raw_content, str):
+            content = raw_content.strip()
+        elif isinstance(raw_content, list):
+            text_parts: List[str] = []
+            for part in raw_content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = "".join(text_parts).strip()
+        else:
+            content = str(raw_content or "").strip()
         if not content:
             raise ValueError(f"Empty response for {schema_name}")
         try:
@@ -1055,6 +1442,9 @@ class StagedRelationExtractor:
         """
         if not pages:
             return []
+        if len(pages) == 1:
+            text, meta = pages[0]
+            return [self._combine_cluster([(text, meta)])]
         texts = [text for text, _ in pages]
         labels = [meta.get("page") for _, meta in pages]
         embeddings = _embed_texts(texts, model_name, device=device)
@@ -1115,76 +1505,79 @@ class StagedRelationExtractor:
         Optional LLM-assisted brand pruning after recall-heavy extraction.
         Goal: reduce to canonical brands, not to fill gaps.
         """
-        if not brands or len(brands) < int(self.config.get("brand_refine_min_count", 3)):
-            return brands
+        if not brands:
+            return []
 
-        # prepare clusters by name similarity
-        clusters = self._cluster_brand_names(
-            brands,
-            model_name=self.config.get("brand_refine_embed_model", "sentence-transformers/all-MiniLM-L6-v2"),
-            distance_threshold=float(self.config.get("brand_refine_threshold", 0.35)),
-            device=self.config.get("brand_refine_device", "cpu"),
-        )
-
-        refined: List[Dict] = []
-        pbar = None
-        if getattr(self, "_show_progress", False):
-            pbar = tqdm(total=len(clusters), desc="Stage A: brand refine", unit="cluster")
-        for cluster in clusters:
-            # rank candidates by page coverage
-            cluster_sorted = sorted(
-                cluster, key=lambda b: len(_dedup_list(b.get("pages", []))), reverse=True
+        refined: List[Dict] = list(brands)
+        min_refine_count = int(self.config.get("brand_refine_min_count", 3))
+        if len(brands) >= min_refine_count:
+            # prepare clusters by name similarity
+            clusters = self._cluster_brand_names(
+                brands,
+                model_name=self.config.get("brand_refine_embed_model", "sentence-transformers/all-MiniLM-L6-v2"),
+                distance_threshold=float(self.config.get("brand_refine_threshold", 0.35)),
+                device=self.config.get("brand_refine_device", "cpu"),
             )
-            candidate_payload = [
-                {
-                    "name": b.get("name", ""),
-                    "pages": len(_dedup_list(b.get("pages", []))),
-                    "evidence": (b.get("evidence") or [])[:3],
-                }
-                for b in cluster_sorted[:5]
-            ]
-            try:
-                result = await self._acall(
-                    build_brand_filter_messages(candidate_payload),
-                    BRAND_FILTER_SCHEMA,
-                    "brand_filter_schema",
-                    {"cluster_size": len(cluster_sorted)},
+
+            refined = []
+            pbar = None
+            if getattr(self, "_show_progress", False):
+                pbar = tqdm(total=len(clusters), desc="Stage A: brand refine", unit="cluster")
+            for cluster in clusters:
+                # rank candidates by page coverage
+                cluster_sorted = sorted(
+                    cluster, key=lambda b: len(_dedup_list(b.get("pages", []))), reverse=True
                 )
-                keep_names = [n.strip() for n in result.get("keep", []) if n and n.strip()]
-            except Exception as exc:  # noqa: BLE001
-                _append_error(error_log, "brand_refine", {"cluster": candidate_payload}, exc)
-                self.logger.error("Brand refine failed on cluster %s: %s", candidate_payload, exc)
-                keep_names = []
+                candidate_payload = [
+                    {
+                        "name": b.get("name", ""),
+                        "pages": len(_dedup_list(b.get("pages", []))),
+                        "evidence": (b.get("evidence") or [])[:3],
+                    }
+                    for b in cluster_sorted[:5]
+                ]
+                try:
+                    result = await self._acall(
+                        build_brand_filter_messages(candidate_payload),
+                        BRAND_FILTER_SCHEMA,
+                        "brand_filter_schema",
+                        {"cluster_size": len(cluster_sorted)},
+                    )
+                    keep_names = [n.strip() for n in result.get("keep", []) if n and n.strip()]
+                except Exception as exc:  # noqa: BLE001
+                    _append_error(error_log, "brand_refine", {"cluster": candidate_payload}, exc)
+                    self.logger.error("Brand refine failed on cluster %s: %s", candidate_payload, exc)
+                    keep_names = []
 
-            # choose canonical brand: prefer LLM keep, else top by pages
-            chosen = None
-            if keep_names:
-                norm_map = {_normalize_brand_key(b.get("name", "")): b for b in cluster_sorted}
-                for name in keep_names:
-                    key = _normalize_brand_key(name)
-                    if key in norm_map:
-                        chosen = norm_map[key]
-                        break
-            if chosen is None:
-                chosen = cluster_sorted[0]
+                # choose canonical brand: prefer LLM keep, else top by pages
+                chosen = None
+                if keep_names:
+                    norm_map = {_normalize_brand_key(b.get("name", "")): b for b in cluster_sorted}
+                    for name in keep_names:
+                        key = _normalize_brand_key(name)
+                        if key in norm_map:
+                            chosen = norm_map[key]
+                            break
+                if chosen is None:
+                    chosen = cluster_sorted[0]
 
-            # merge evidence/pages from entire cluster into chosen
-            merged_ev: List[str] = []
-            merged_pages: List = []
-            for b in cluster:
-                merged_ev.extend(b.get("evidence", []))
-                merged_pages.extend(b.get("pages", []))
-            chosen_merged = dict(chosen)
-            chosen_merged["evidence"] = _dedup_list(chosen_merged.get("evidence", []) + merged_ev)
-            chosen_merged["pages"] = _dedup_list(chosen_merged.get("pages", []) + merged_pages)
+                # merge evidence/pages from entire cluster into chosen
+                merged_ev: List[str] = []
+                merged_pages: List = []
+                for b in cluster:
+                    merged_ev.extend(b.get("evidence", []))
+                    merged_pages.extend(b.get("pages", []))
+                chosen_merged = dict(chosen)
+                chosen_merged["evidence"] = _dedup_list(chosen_merged.get("evidence", []) + merged_ev)
+                chosen_merged["pages"] = _dedup_list(chosen_merged.get("pages", []) + merged_pages)
 
-            # avoid duplicates in refined list
-            if all(_normalize_brand_key(chosen_merged["name"]) != _normalize_brand_key(x["name"]) for x in refined):
-                refined.append(chosen_merged)
+                # avoid duplicates in refined list
+                if all(_normalize_brand_key(chosen_merged["name"]) != _normalize_brand_key(x["name"]) for x in refined):
+                    refined.append(chosen_merged)
+                if pbar:
+                    pbar.update(1)
             if pbar:
-                pbar.update(1)
-        if pbar:
-            pbar.close()
+                pbar.close()
 
         # final cap to avoid long tail
         max_candidates = int(self.config.get("brand_max_candidates", 12))
@@ -1193,16 +1586,18 @@ class StagedRelationExtractor:
         )[:max_candidates]
 
         # bilingual / alias merge using multilingual embeddings
-        refined = _merge_translated_brands(
-            refined,
-            model_name=self.config.get(
-                "brand_translate_embed_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-            ),
-            distance_threshold=float(self.config.get("brand_translate_threshold", 0.25)),
-            device=self.config.get("brand_translate_device", "cpu"),
-        )
+        if len(refined) > 1:
+            refined = _merge_translated_brands(
+                refined,
+                model_name=self.config.get(
+                    "brand_translate_embed_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+                ),
+                distance_threshold=float(self.config.get("brand_translate_threshold", 0.25)),
+                device=self.config.get("brand_translate_device", "cpu"),
+            )
 
         # global LLM pass to drop residual series/model/non-brand items
+        pre_global_refined = list(refined)
         try:
             candidate_payload = [
                 {
@@ -1224,10 +1619,64 @@ class StagedRelationExtractor:
             _append_error(error_log, "brand_global_filter", {}, exc)
             self.logger.error("Brand global filter failed: %s", exc)
 
+        if not refined and pre_global_refined:
+            refined = sorted(
+                pre_global_refined,
+                key=lambda b: len(_dedup_list(b.get("pages", []))),
+                reverse=True,
+            )[:1]
+
         # canonicalize to Chinese brand form
         refined, alias_map = await self._canonicalize_brands(refined, error_log)
+        if bool(self.config.get("single_brand_per_document", True)) and len(refined) > 1:
+            refined = await self._select_primary_brand(refined, error_log)
+            keep_keys = {_normalize_brand_key(item.get("name", "")) for item in refined}
+            alias_map = {
+                canonical: aliases
+                for canonical, aliases in alias_map.items()
+                if _normalize_brand_key(canonical) in keep_keys
+            }
         self.brand_alias_map = alias_map
         return refined
+
+    async def _select_primary_brand(self, brands: List[Dict], error_log: Path) -> List[Dict]:
+        """
+        Document-level brand decision: keep one primary manufacturer brand.
+        """
+        if not brands:
+            return []
+        if len(brands) == 1:
+            return brands
+
+        candidates = sorted(
+            brands, key=lambda b: len(_dedup_list(b.get("pages", []))), reverse=True
+        )
+        payload = [
+            {
+                "name": item.get("name", ""),
+                "pages": len(_dedup_list(item.get("pages", []))),
+                "evidence": (item.get("evidence") or [])[:3],
+            }
+            for item in candidates[:12]
+        ]
+        try:
+            result = await self._acall(
+                build_brand_primary_messages(payload),
+                BRAND_FILTER_SCHEMA,
+                "brand_primary_schema",
+                {"stage": "brand_primary"},
+            )
+            keep_names = [_normalize_brand_key(name) for name in result.get("keep", []) if name]
+            if keep_names:
+                kept = [item for item in candidates if _normalize_brand_key(item.get("name", "")) in set(keep_names)]
+                if kept:
+                    return [kept[0]]
+        except Exception as exc:  # noqa: BLE001
+            _append_error(error_log, "brand_primary", {}, exc)
+            self.logger.error("Brand primary selection failed: %s", exc)
+
+        # deterministic fallback by page coverage if LLM selection fails.
+        return [candidates[0]]
 
     async def _canonicalize_brands(
         self, brands: List[Dict], error_log: Path
@@ -1277,6 +1726,8 @@ class StagedRelationExtractor:
         return list(merged.values()), alias_map
 
     async def extract_brands(self, pages: Sequence[Tuple[str, Dict]], error_log: Path) -> List[Dict]:
+        self.brand_candidates_all = []
+        self.brand_dropped = []
         tasks = [
             asyncio.create_task(self._extract_brands_single(text, meta, error_log))
             for text, meta in pages
@@ -1341,14 +1792,22 @@ class StagedRelationExtractor:
                 for brand_list in cluster_results:
                     merged_list.extend(brand_list)
                 merged_list = _merge_brand_candidates(merged_list)
-        # prune long-tail noisy candidates to keep downstream stages tractable
-        merged_list = _prune_brands(
-            merged_list,
-            min_page_ratio=float(self.config.get("brand_min_page_ratio", 0.15)),
-            max_candidates=int(self.config.get("brand_max_candidates", 12)),
+        all_candidates = _snapshot_brand_candidates(merged_list)
+        # Optional lightweight pre-prune before LLM refinement.
+        if bool(self.config.get("brand_use_pre_prune", False)):
+            merged_list = _prune_brands(
+                merged_list,
+                min_page_ratio=float(self.config.get("brand_min_page_ratio", 0.15)),
+                max_candidates=int(self.config.get("brand_max_candidates", 12)),
+            )
+        refined_brands = await self._refine_brands(merged_list, error_log)
+        self.brand_candidates_all = all_candidates
+        self.brand_dropped = _build_dropped_brand_cache(
+            all_candidates,
+            refined_brands,
+            self.brand_alias_map,
         )
-        merged_list = await self._refine_brands(merged_list, error_log)
-        return merged_list
+        return refined_brands
 
     # -------------------------- Pipeline facades -------------------------- #
     async def run_brand_stage(self, pages: Sequence[Tuple[str, Dict]], error_log: Path) -> List[Dict]:
@@ -1386,12 +1845,13 @@ class StagedRelationExtractor:
         error_log: Path,
         page_refs: Optional[List] = None,
         stage_a_pages: Optional[List] = None,
+        show_chunk_progress: bool = True,
     ) -> List[Dict]:
         chunk_pbar = None
         try:
             chunks = _split_text(combined_text, self.config.get("max_chars_per_call", 8000))
             merged = {}
-            if getattr(self, "_show_progress", False):
+            if getattr(self, "_show_progress", False) and show_chunk_progress:
                 brand_label = (brand or "unknown")[:16]
                 chunk_pbar = tqdm(
                     total=len(chunks),
@@ -1451,6 +1911,136 @@ class StagedRelationExtractor:
         finally:
             if chunk_pbar:
                 chunk_pbar.close()
+
+    async def _extract_series_single(
+        self,
+        brand: str,
+        text: str,
+        metadata: Dict,
+        error_log: Path,
+    ) -> List[Dict]:
+        page = metadata.get("page")
+        return await self._extract_series_for_brand(
+            brand,
+            text,
+            error_log,
+            page_refs=[page] if page is not None and str(page) != "" else None,
+            stage_a_pages=[],
+            show_chunk_progress=False,
+        )
+
+    async def _extract_series_cluster(
+        self,
+        brand: str,
+        text: str,
+        page_labels: List,
+        error_log: Path,
+    ) -> List[Dict]:
+        return await self._extract_series_for_brand(
+            brand,
+            text,
+            error_log,
+            page_refs=_dedup_list([p for p in (page_labels or []) if p is not None and str(p) != ""]),
+            stage_a_pages=[],
+            show_chunk_progress=False,
+        )
+
+    async def _extract_series_features_for_brand(
+        self,
+        brand: str,
+        series_names: List[str],
+        relevant_pages: Sequence[Tuple[str, Dict]],
+        error_log: Path,
+        source_category: str = "series_feature_stage_b",
+    ) -> None:
+        """
+        Stage-B series_feature extraction:
+        produce series-level features/components before Stage C/D.
+        """
+        if not brand or not series_names or not relevant_pages:
+            return
+
+        chunk_size = self._resolve_series_chunk_size()
+        page_chunks = _chunk_sequence(relevant_pages, chunk_size)
+        for chunk_pages in page_chunks:
+            combined = _combine_pages(chunk_pages, self.config)
+            chunk_refs = _dedup_list(
+                [
+                    meta.get("page")
+                    for _, meta in chunk_pages
+                    if meta.get("page") is not None and str(meta.get("page")) != ""
+                ]
+            )
+            try:
+                payload = await self._acall(
+                    build_series_feature_messages(
+                        brand,
+                        series_names,
+                        combined,
+                        chunk_pages=chunk_refs,
+                    ),
+                    SERIES_FEATURE_SCHEMA,
+                    "series_feature_schema",
+                    {"brand": brand, "series_count": len(series_names), "chunk_pages": chunk_refs},
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "series_feature_extract",
+                    {"brand": brand, "chunk_pages": chunk_refs},
+                    exc,
+                )
+                self.logger.warning(
+                    "Stage B series_feature extract failed for brand=%s pages=%s: %s",
+                    brand,
+                    chunk_refs,
+                    exc,
+                )
+                continue
+
+            alias_map = self.series_alias_map.get(brand, {})
+            for item in payload.get("items", []) or []:
+                series_guess = str(item.get("series") or "").strip()
+                canonical = _match_series_name(series_guess, brand, alias_map)
+                if not canonical:
+                    # fallback: direct hit on current series list
+                    for s in series_names:
+                        if _series_merge_key(s) == _series_merge_key(series_guess):
+                            canonical = s
+                            break
+                if not canonical:
+                    continue
+
+                entry = {
+                    "title": str(item.get("title") or "").strip() or canonical,
+                    "fact_text": _dedup_list([str(x).strip() for x in (item.get("fact_text") or []) if str(x).strip()]),
+                    "features": _dedup_list([str(x).strip() for x in (item.get("features") or []) if str(x).strip()]),
+                    "key_components": _dedup_list([str(x).strip() for x in (item.get("key_components") or []) if str(x).strip()]),
+                    "performance_specs": [],
+                    "evidence": _dedup_list([str(x).strip() for x in (item.get("evidence") or []) if str(x).strip()]),
+                    "source_category": source_category,
+                    "series_feature_flag": True,
+                }
+                pages_field = item.get("pages") or []
+                if pages_field:
+                    entry["pages"] = _dedup_list(pages_field)
+                self._store_series_feature_entry(brand, canonical, entry)
+                if entry.get("key_components"):
+                    self._store_series_components(brand, canonical, entry.get("key_components") or [])
+
+    def _store_series_feature_entry(
+        self,
+        brand: str,
+        series: str,
+        entry: Dict,
+    ) -> None:
+        brand_bucket = self.series_feature_map.setdefault(brand, {})
+        feature_list = brand_bucket.setdefault(series or "", [])
+        key = json.dumps(entry or {}, ensure_ascii=False, sort_keys=True)
+        for existing in feature_list:
+            if json.dumps(existing or {}, ensure_ascii=False, sort_keys=True) == key:
+                return
+        feature_list.append(entry)
 
     def _resolve_series_chunk_size(self) -> int:
         """
@@ -1793,64 +2383,83 @@ class StagedRelationExtractor:
         self, brands: List[Dict], pages: Sequence[Tuple[str, Dict]], error_log: Path
     ) -> Dict[str, List[Dict]]:
         brand_to_series: Dict[str, List[Dict]] = {}
-        iterator = brands
-        pbar = None
-        if getattr(self, "_show_progress", False):
-            pbar = tqdm(total=len(brands), desc="Stage B: series", unit="brand")
-        for brand_item in iterator:
+        if not brands:
+            return brand_to_series
+
+        show_progress = bool(getattr(self, "_show_progress", False))
+        for brand_item in brands:
             brand_name = brand_item["name"]
-            brand_aliases = self.brand_alias_map.get(brand_name, []) if hasattr(self, "brand_alias_map") else []
-            series_keyword_boost = self.config.get("series_keyword_boost", [])
-            if isinstance(series_keyword_boost, str):
-                series_keyword_boost = [
-                    k.strip() for k in series_keyword_boost.split(",") if k.strip()
-                ]
-            keywords = _dedup_list([brand_name] + brand_aliases + list(series_keyword_boost))
-            relevant_pages, stage_a_pages = self._collect_series_context_pages(
-                brand_item,
-                pages,
-                keywords,
-            )
-
-            # Stage-B page grouping: 2 or 3 pages per chunk.
-            chunk_size = self._resolve_series_chunk_size()
-            chunks = _chunk_sequence(relevant_pages, chunk_size)
             raw_series_list: List[Dict] = []
+            async def _run_page(text: str, meta: Dict) -> List[Dict]:
+                return await self._extract_series_single(brand_name, text, meta, error_log)
 
-            async def _run_chunk(chunk_pages: Sequence[Tuple[str, Dict]]) -> List[Dict]:
-                combined = _combine_pages(chunk_pages, self.config)
-                chunk_refs = _dedup_list(
-                    [
-                        meta.get("page")
-                        for _, meta in chunk_pages
-                        if meta.get("page") is not None and str(meta.get("page")) != ""
-                    ]
-                )
-                return await self._extract_series_for_brand(
-                    brand_name,
-                    combined,
-                    error_log,
-                    page_refs=chunk_refs,
-                    stage_a_pages=stage_a_pages,
-                )
-
-            if len(chunks) == 1:
-                raw_series_list = await _run_chunk(chunks[0])
-            else:
-                sem = asyncio.Semaphore(_get_concurrency(self.config, "series_chunk_concurrency", 6))
-
-                async def _bounded(chunk_pages):
-                    async with sem:
-                        return await _run_chunk(chunk_pages)
-
-                tasks = [asyncio.create_task(_bounded(c)) for c in chunks]
-                results = await asyncio.gather(*tasks)
+            page_tasks = [asyncio.create_task(_run_page(text, meta)) for text, meta in pages]
+            if page_tasks:
+                if show_progress:
+                    results = []
+                    with tqdm(total=len(page_tasks), desc="Stage B: series", unit="page") as pbar:
+                        for coro in asyncio.as_completed(page_tasks):
+                            res = await coro
+                            results.append(res)
+                            pbar.update(1)
+                else:
+                    results = await asyncio.gather(*page_tasks)
                 for res in results:
                     raw_series_list.extend(res or [])
 
-            # Stage-B candidate consolidation (similar to Stage-A: merge -> semantic merge -> LLM review)
             raw_series_list = _merge_series_candidates(raw_series_list)
 
+            cluster_size = int(self.config.get("series_cluster_size", 2))
+            cluster_mode = str(self.config.get("series_cluster_mode", "fixed")).strip().lower()
+            use_embed_cluster = bool(self.config.get("series_use_embed_cluster", False))
+            if use_embed_cluster:
+                cluster_mode = "embed"
+            clusters: List[Tuple[str, List]] = []
+            if cluster_size > 1:
+                if cluster_mode == "embed":
+                    clusters = self._cluster_pages_for_brands_embed(
+                        pages,
+                        model_name=self.config.get(
+                            "series_cluster_embed_model",
+                            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                        ),
+                        distance_threshold=float(self.config.get("series_cluster_embed_threshold", 0.25)),
+                        device=self.config.get("series_cluster_embed_device", "cpu"),
+                    )
+                else:
+                    clusters = self._cluster_pages_for_brands(pages, cluster_size)
+
+            if clusters:
+                async def _run_cluster(cluster_text: str, page_labels: List) -> List[Dict]:
+                    return await self._extract_series_cluster(
+                        brand_name,
+                        cluster_text,
+                        page_labels,
+                        error_log,
+                    )
+
+                cluster_tasks = [
+                    asyncio.create_task(_run_cluster(cluster_text, page_labels))
+                    for cluster_text, page_labels in clusters
+                ]
+                if show_progress:
+                    cluster_results = []
+                    with tqdm(
+                        total=len(clusters),
+                        desc="Stage B: series clusters",
+                        unit="cluster",
+                    ) as pbar:
+                        for coro in asyncio.as_completed(cluster_tasks):
+                            res = await coro
+                            cluster_results.append(res)
+                            pbar.update(1)
+                else:
+                    cluster_results = await asyncio.gather(*cluster_tasks)
+                for res in cluster_results:
+                    raw_series_list.extend(res or [])
+                raw_series_list = _merge_series_candidates(raw_series_list)
+
+            # Stage-B candidate consolidation (similar to Stage-A: merge -> semantic merge -> LLM review)
             raw_series_list = _merge_series_semantic(
                 raw_series_list,
                 model_name=self.config.get(
@@ -1868,11 +2477,45 @@ class StagedRelationExtractor:
             )
             self.series_alias_map[brand_name] = alias_map
 
+            # Stage-B writes series-level features/components before Stage C/D.
+            feature_page_numbers: List = []
+            for series_item in series_list:
+                series_name = str(series_item.get("name") or "").strip()
+                if not series_name:
+                    continue
+                feature_page_numbers.extend(series_item.get("pages", []))
+                aliases = alias_map.get(series_name, [])
+                feature_page_numbers.extend(
+                    _collect_series_occurrence_pages(_dedup_list([series_name] + aliases), pages)
+                )
+            feature_page_numbers = _dedup_list(
+                [p for p in feature_page_numbers if p is not None and str(p) != ""]
+            )
+            feature_follow = int(self.config.get("series_context_follow_pages", 1))
+            if feature_page_numbers:
+                relevant_pages = _select_pages_by_numbers_with_following(
+                    pages,
+                    feature_page_numbers,
+                    follow_after=feature_follow,
+                )
+                if not relevant_pages:
+                    relevant_pages = _select_pages_by_numbers_with_following(
+                        pages,
+                        feature_page_numbers,
+                        follow_after=0,
+                    )
+            else:
+                relevant_pages = list(pages)
+
+            await self._extract_series_features_for_brand(
+                brand_name,
+                [str(item.get("name") or "").strip() for item in series_list if str(item.get("name") or "").strip()],
+                relevant_pages,
+                error_log,
+                source_category="series_feature_stage_b",
+            )
+
             brand_to_series[brand_name] = series_list
-            if pbar:
-                pbar.update(1)
-        if pbar:
-            pbar.close()
         return _enrich_series_by_brand(brand_to_series)
 
     # -------------------------- Stage C: models ---------------------------- #
@@ -1881,6 +2524,7 @@ class StagedRelationExtractor:
         brand: str,
         series: str,
         text_block: str,
+        context_pages: Optional[List],
         error_log: Path,
     ) -> List[Dict]:
         chunk_pbar = None
@@ -1901,7 +2545,12 @@ class StagedRelationExtractor:
                 try:
                     async with chunk_sem:
                         payload = await self._acall(
-                            build_model_messages(brand, series, chunk_text),
+                            build_model_messages(
+                                brand,
+                                series,
+                                chunk_text,
+                                context_pages=context_pages,
+                            ),
                             MODEL_SCHEMA,
                             "model_schema",
                             {
@@ -2003,6 +2652,7 @@ class StagedRelationExtractor:
                     self._store_series_feature(brand, series, prod, decision)
                     continue
                 if role == "accessory":
+                    self._store_series_components_from_product(brand, series, prod)
                     continue
                 if decision.get("keep") and role == "product" and not decision.get("is_accessory"):
                     reviewed.append(prod)
@@ -2022,22 +2672,118 @@ class StagedRelationExtractor:
     ) -> None:
         """Persist series-level feature/benefit snippets for later reuse."""
         series_key = series or ""
-        brand_bucket = self.series_feature_map.setdefault(brand, {})
-        feature_list = brand_bucket.setdefault(series_key, [])
         entry = {
             "title": prod.get("product_model", ""),
             "fact_text": prod.get("fact_text", []),
             "features": prod.get("features", []),
+            "key_components": prod.get("key_components", []),
             "performance_specs": prod.get("performance_specs", []),
             "evidence": _dedup_list(prod.get("evidence", [])),
             "source_category": prod.get("category", ""),
         }
         if decision is not None:
             entry["series_feature_flag"] = bool(decision.get("series_feature", False))
-        title_norm = _normalize_name(entry.get("title", ""))
-        if any(_normalize_name(item.get("title", "")) == title_norm for item in feature_list):
+        self._store_series_feature_entry(brand, series_key, entry)
+        self._store_series_components(brand, series_key, entry.get("key_components") or [])
+
+    def _store_series_components(self, brand: str, series: str, components: List[str]) -> None:
+        if not brand:
             return
-        feature_list.append(entry)
+        normalized = _dedup_list([str(c).strip() for c in (components or []) if str(c).strip()])
+        if not normalized:
+            return
+        brand_bucket = self.series_component_map.setdefault(brand, {})
+        series_bucket = brand_bucket.setdefault(series or "", [])
+        brand_bucket[series or ""] = _dedup_list(series_bucket + normalized)
+
+    def _store_series_components_from_product(self, brand: str, series: str, prod: Dict) -> None:
+        components: List[str] = []
+        for key in ["key_components", "features"]:
+            components.extend([str(x).strip() for x in (prod.get(key) or []) if str(x).strip()])
+        model = _canonicalize_model_name(prod.get("product_model") or "")
+        if model:
+            components.append(model)
+        if not components:
+            return
+        self._store_series_components(brand, series, components)
+
+    def _merge_series_components_into_products(self, products: List[Dict]) -> List[Dict]:
+        if not products:
+            return products
+        merged_products: List[Dict] = []
+        for prod in products:
+            brand = str(prod.get("brand") or "").strip()
+            series = str(prod.get("series") or "").strip()
+            mapped = (
+                self.series_component_map.get(brand, {}).get(series, [])
+                if brand and series
+                else []
+            )
+            if mapped:
+                prod = dict(prod)
+                prod["key_components"] = _dedup_list(
+                    [str(x).strip() for x in (prod.get("key_components") or []) if str(x).strip()]
+                    + [str(x).strip() for x in mapped if str(x).strip()]
+                )
+            merged_products.append(prod)
+        return merged_products
+
+    def _merge_series_features_into_products(self, products: List[Dict]) -> List[Dict]:
+        if not products:
+            return products
+        merged_products: List[Dict] = []
+        for prod in products:
+            brand = str(prod.get("brand") or "").strip()
+            series = str(prod.get("series") or "").strip()
+            entries = (
+                self.series_feature_map.get(brand, {}).get(series, [])
+                if brand and series
+                else []
+            )
+            if not entries:
+                merged_products.append(prod)
+                continue
+
+            merged = dict(prod)
+            merged_features = [str(x).strip() for x in (merged.get("features") or []) if str(x).strip()]
+            merged_fact_text = [str(x).strip() for x in (merged.get("fact_text") or []) if str(x).strip()]
+            merged_key_components = [
+                str(x).strip() for x in (merged.get("key_components") or []) if str(x).strip()
+            ]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                merged_features.extend(
+                    [str(x).strip() for x in (entry.get("features") or []) if str(x).strip()]
+                )
+                merged_fact_text.extend(
+                    [str(x).strip() for x in (entry.get("fact_text") or []) if str(x).strip()]
+                )
+                merged_key_components.extend(
+                    [str(x).strip() for x in (entry.get("key_components") or []) if str(x).strip()]
+                )
+
+            merged["features"] = _dedup_list(merged_features)
+            merged["fact_text"] = _dedup_list(merged_fact_text)
+            merged["key_components"] = _dedup_list(merged_key_components)
+            merged_products.append(merged)
+        return merged_products
+
+    def _bootstrap_series_components_from_series_features(self) -> None:
+        """Hydrate component map from cached series_features entries."""
+        self.series_component_map = {}
+        for brand, series_map in (self.series_feature_map or {}).items():
+            if not isinstance(series_map, dict):
+                continue
+            for series, entries in series_map.items():
+                if not isinstance(entries, list):
+                    continue
+                components: List[str] = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    components.extend(entry.get("key_components") or [])
+                self._store_series_components(brand, series, components)
 
     def _bind_products_to_known_models(
         self,
@@ -2235,12 +2981,7 @@ class StagedRelationExtractor:
                 series_terms = _dedup_list([series_name] + series_aliases)
                 occurrence_pages = _collect_series_occurrence_pages(series_terms, pages)
                 base_pages = _dedup_list((series_pages or []) + occurrence_pages)
-                follow_after = int(
-                    self.config.get(
-                        "series_context_follow_pages",
-                        self.config.get("model_context_follow_pages", 2),
-                    )
-                )
+                follow_after = int(self.config.get("series_model_follow_pages", 1))
                 relevant_pages = _select_pages_by_numbers_with_following(
                     pages,
                     base_pages,
@@ -2260,11 +3001,29 @@ class StagedRelationExtractor:
                         series_name,
                     )
                     return _pair_key(brand, series_name), []
+
+                context_page_refs = _dedup_list(
+                    [
+                        meta.get("page")
+                        for _, meta in relevant_pages
+                        if meta.get("page") is not None and str(meta.get("page")) != ""
+                    ]
+                )
+                # Stage C also captures series-level features/components from the same strict context.
+                if series_name:
+                    await self._extract_series_features_for_brand(
+                        brand,
+                        [series_name],
+                        relevant_pages,
+                        error_log,
+                        source_category="series_feature_stage_c",
+                    )
                 text_block = _combine_pages(relevant_pages, self.config)
                 pair_models = await self._extract_models_for_pair(
                     brand,
                     series_name,
                     text_block,
+                    context_page_refs,
                     error_log,
                 )
                 return _pair_key(brand, series_name), pair_models
@@ -2506,7 +3265,7 @@ class StagedRelationExtractor:
                 )
                 if not known_models:
                     return pair_index, []
-                follow_after = int(self.config.get("model_context_follow_pages", 2))
+                follow_after = int(self.config.get("product_model_follow_pages", 0))
                 model_to_pages: Dict[str, List] = {}
                 for model_item in pair_models:
                     model_name = _canonicalize_model_name(model_item.get("name") or "")
@@ -2527,8 +3286,6 @@ class StagedRelationExtractor:
                 async def _run_model(model_name: str) -> List[Dict]:
                     async with model_sem:
                         model_pages = model_to_pages.get(model_name, [])
-                        if not model_pages and series_pages:
-                            model_pages = _dedup_list(series_pages)
                         if not model_pages:
                             return []
                         model_relevant_pages = _select_pages_by_numbers_with_following(
@@ -2619,6 +3376,8 @@ class StagedRelationExtractor:
 
         for pair_index in range(len(pairs)):
             products.extend(result_map.get(pair_index, []))
+        products = self._merge_series_features_into_products(products)
+        products = self._merge_series_components_into_products(products)
         products = _deduplicate_products_by_model(products, self.config)
 
         if pbar:
@@ -3766,6 +4525,8 @@ def extract_relations_multistage(
     stage_dir.mkdir(parents=True, exist_ok=True)
     brand_file = stage_dir / "brands.json"
     brand_alias_file = stage_dir / "brand_aliases.json"
+    brand_candidates_file = stage_dir / "brand_candidates.json"
+    brand_dropped_file = stage_dir / "brand_dropped.json"
     series_file = stage_dir / "series.json"
     series_alias_file = stage_dir / "series_aliases.json"
     series_features_file = stage_dir / "series_features.json"
@@ -3783,14 +4544,29 @@ def extract_relations_multistage(
         # Stage A: brands
         if brand_file.exists() and not force_rerun:
             brands = json.loads(brand_file.read_text(encoding="utf-8"))
+            if brand_alias_file.exists():
+                extractor.brand_alias_map = json.loads(brand_alias_file.read_text(encoding="utf-8"))
+            if brand_candidates_file.exists():
+                extractor.brand_candidates_all = json.loads(
+                    brand_candidates_file.read_text(encoding="utf-8")
+                )
+            if brand_dropped_file.exists():
+                extractor.brand_dropped = json.loads(brand_dropped_file.read_text(encoding="utf-8"))
         else:
             brands = await extractor.run_brand_stage(pages, error_log_path)
-            brand_file.write_text(json.dumps(brands, ensure_ascii=False, indent=2), encoding="utf-8")
-            if extractor.brand_alias_map:
-                brand_alias_file.write_text(
-                    json.dumps(extractor.brand_alias_map, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+        brand_file.write_text(json.dumps(brands, ensure_ascii=False, indent=2), encoding="utf-8")
+        brand_alias_file.write_text(
+            json.dumps(extractor.brand_alias_map or {}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        brand_candidates_file.write_text(
+            json.dumps(extractor.brand_candidates_all or [], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        brand_dropped_file.write_text(
+            json.dumps(extractor.brand_dropped or [], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         if not brands:
             return []
@@ -3802,13 +4578,16 @@ def extract_relations_multistage(
                 extractor.series_alias_map = json.loads(series_alias_file.read_text(encoding="utf-8"))
         else:
             brand_to_series = await extractor.run_series_stage(brands, pages, error_log_path)
-            series_file.write_text(json.dumps(brand_to_series, ensure_ascii=False, indent=2), encoding="utf-8")
-            if extractor.series_alias_map:
-                series_alias_file.write_text(
-                    json.dumps(extractor.series_alias_map, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-        brand_to_series = _enrich_series_by_brand(brand_to_series)
+        brand_to_series, extractor.series_alias_map, _ = _enforce_single_brand_series_scope(
+            brands,
+            brand_to_series,
+            extractor.series_alias_map,
+        )
+        series_file.write_text(json.dumps(brand_to_series, ensure_ascii=False, indent=2), encoding="utf-8")
+        series_alias_file.write_text(
+            json.dumps(extractor.series_alias_map or {}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         # Stage C: models
         if models_file.exists() and not force_rerun:
@@ -3834,21 +4613,48 @@ def extract_relations_multistage(
                     json.dumps(extractor.model_conflicts, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-        extractor.models_by_pair = _enrich_models_by_pair(extractor.models_by_pair)
+        extractor.models_by_pair, _ = _enforce_single_brand_models_scope(
+            brands,
+            extractor.models_by_pair,
+        )
+        extractor.model_conflicts, _ = _remap_model_conflicts_to_single_brand(
+            brands,
+            extractor.model_conflicts,
+        )
+        models_file.write_text(
+            json.dumps(extractor.models_by_pair, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        model_pages_file.write_text(
+            json.dumps(extractor.model_page_stats, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if extractor.model_conflicts or model_conflicts_file.exists():
+            model_conflicts_file.write_text(
+                json.dumps(extractor.model_conflicts or {}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        if series_features_file.exists() and not force_rerun:
+            extractor.series_feature_map = json.loads(series_features_file.read_text(encoding="utf-8"))
+            extractor._bootstrap_series_components_from_series_features()
 
         # Stage D: products
         if products_file.exists() and not force_rerun:
             products = json.loads(products_file.read_text(encoding="utf-8"))
-            if series_features_file.exists():
-                extractor.series_feature_map = json.loads(series_features_file.read_text(encoding="utf-8"))
         else:
             products = await extractor.run_product_stage(brand_to_series, pages, error_log_path)
-            products_file.write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding="utf-8")
-            if extractor.series_feature_map:
-                series_features_file.write_text(
-                    json.dumps(extractor.series_feature_map, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+        products, _ = _enforce_single_brand_products_scope(brands, products)
+        extractor.series_feature_map, _ = _enforce_single_brand_series_feature_scope(
+            brands,
+            extractor.series_feature_map,
+        )
+        products_file.write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding="utf-8")
+        if extractor.series_feature_map or series_features_file.exists():
+            series_features_file.write_text(
+                json.dumps(extractor.series_feature_map or {}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         # Hierarchy relation views (always refresh to keep caches consistent).
         brand_series_relations = _build_brand_series_relations(brands, brand_to_series)

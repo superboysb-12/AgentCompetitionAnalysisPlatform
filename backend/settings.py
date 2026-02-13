@@ -176,6 +176,10 @@ RELATION_EXTRACTOR_CONFIG = {
     "brand_refine_threshold": float(os.getenv("BRAND_REFINE_THRESHOLD", 0.35)),
     "brand_refine_device": os.getenv("BRAND_REFINE_DEVICE", "cpu"),
     "brand_refine_min_count": int(os.getenv("BRAND_REFINE_MIN_COUNT", 3)),
+    # Disabled by default: prefer LLM-based filtering/selection over heuristic pre-prune.
+    "brand_use_pre_prune": os.getenv("BRAND_USE_PRE_PRUNE", "false").lower() == "true",
+    # Single brochure usually maps to one manufacturer brand.
+    "single_brand_per_document": os.getenv("SINGLE_BRAND_PER_DOCUMENT", "true").lower() == "true",
     "brand_translate_embed_model": os.getenv(
         "BRAND_TRANSLATE_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     ),

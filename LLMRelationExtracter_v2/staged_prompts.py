@@ -30,7 +30,7 @@ BRAND_SCHEMA: Dict = {
     "required": ["brands"],
 }
 
-# Series schema: conditioned on a brand
+# Series schema: document-level extraction, with brand as ownership echo.
 SERIES_SCHEMA: Dict = {
     "type": "object",
     "additionalProperties": False,
@@ -89,7 +89,10 @@ MODEL_REVIEW_SCHEMA: Dict = {
                 "properties": {
                     "name": {"type": "string"},
                     "keep": {"type": "boolean"},
-                    "kind": {"type": "string", "enum": ["model", "series", "other"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["model", "series", "accessory", "other"],
+                    },
                     "series_guess": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                     "redirect_to": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                     "confidence": {"anyOf": [{"type": "number"}, {"type": "null"}]},
@@ -159,6 +162,39 @@ SERIES_CANON_SCHEMA: Dict = {
     },
     "required": ["items"],
 }
+SERIES_FEATURE_SCHEMA: Dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "brand": {"type": "string"},
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "series": {"type": "string"},
+                    "title": {"type": "string"},
+                    "fact_text": {"type": "array", "items": {"type": "string"}},
+                    "features": {"type": "array", "items": {"type": "string"}},
+                    "key_components": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "pages": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": [
+                    "series",
+                    "title",
+                    "fact_text",
+                    "features",
+                    "key_components",
+                    "evidence",
+                    "pages",
+                ],
+            },
+        },
+    },
+    "required": ["brand", "items"],
+}
 BRAND_FILTER_SCHEMA: Dict = {
     "type": "object",
     "additionalProperties": False,
@@ -221,6 +257,7 @@ def build_brand_messages(text: str, page_label: str) -> List[Dict]:
                 "You are a fast brand spotter for HVAC documents. "
                 "Only output manufacturer/brand names (company or trademark). "
                 "Do NOT output product series/lines/models such as GMV ES / GMV9 Flex / Ultra Heat / X-COOLING / Free / Mini-Ultra. "
+                "Do NOT treat product line abbreviations as brands (e.g., GMV/VRV/MULTI-V/CITY MULTI are typically series lines). "
                 "If both Chinese and English names of the same brand appear, keep both entries is fine; never invent new ones. "
                 "Return JSON per schema; if no brand is present, return an empty brands array."
             ),
@@ -260,11 +297,12 @@ def build_series_messages(
         {
             "role": "system",
             "content": (
-                "You are extracting HVAC product series for a given brand. "
+                "You are a fast HVAC product-series spotter for a single-brand document. "
                 "Work only within the provided text. "
                 "Strict hierarchy separation is mandatory: "
                 "brand != series != model != product_type != feature. "
-                "Only output true series/line/sub-brand names under the given brand. "
+                "Only output true series/line/sub-brand names present in this document. "
+                "Do not treat the input brand as a retrieval constraint; it is only an ownership echo field. "
                 "If one sentence/table row contains multiple series names, split them into separate series items. "
                 "Do not concatenate multiple series into one name. "
                 "Only keep HVAC product series. Do not output communication/network/protocol labels "
@@ -277,13 +315,54 @@ def build_series_messages(
         {
             "role": "user",
             "content": (
-                f"Brand: {brand}\n"
+                f"Document primary brand (for output ownership echo only): {brand}\n"
                 f"{stage_hint}"
                 f"{chunk_hint}"
-                "We already know this brand appears in this HVAC document. "
-                "Please extract series / line / sub-brand names under this brand only. "
+                "Please perform a document-level fast scan and extract series / line / sub-brand names. "
                 "Include evidence text snippets. rows_json blocks contain raw CSV rows with table_data/bbox; you may cite them.\n"
                 "If not found, return an empty array.\n\n"
+                f"{combined_text}"
+            ),
+        },
+    ]
+
+
+def build_series_feature_messages(
+    brand: str,
+    series_names: List[str],
+    combined_text: str,
+    chunk_pages: Optional[List] = None,
+) -> List[Dict]:
+    chunk_hint = ""
+    if chunk_pages:
+        labels = [str(p) for p in chunk_pages if p is not None and str(p) != ""]
+        if labels:
+            chunk_hint = f"Current context chunk pages: {', '.join(labels)}\n"
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are extracting SERIES-LEVEL features/components for HVAC documents. "
+                "Do not output model-level specs as series features. "
+                "Only output entries that belong to one provided series name. "
+                "If content is accessory/controller/filter/optional module information for a series, "
+                "put it into key_components. "
+                "Prefer concise Chinese key_components terms when available in text. "
+                "Do not invent data; return empty items when absent."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Brand: {brand}\n"
+                f"Candidate series list (must map items to these names): {', '.join(series_names)}\n"
+                f"{chunk_hint}"
+                "Extract series-level items with fields: series/title/fact_text/features/key_components/evidence/pages.\n"
+                "Rules:\n"
+                "- series must be one of provided series names.\n"
+                "- key_components should include accessory/controller/component names if present.\n"
+                "- product_model rows should not be treated as independent products in this task.\n\n"
                 f"{combined_text}"
             ),
         },
@@ -373,14 +452,26 @@ def build_series_canon_messages(brand: str, groups: List[Dict]) -> List[Dict]:
     ]
 
 
-def build_model_messages(brand: str, series: str, text_block: str) -> List[Dict]:
+def build_model_messages(
+    brand: str,
+    series: str,
+    text_block: str,
+    context_pages: Optional[List] = None,
+) -> List[Dict]:
+    page_hint = ""
+    if context_pages:
+        labels = [str(p) for p in context_pages if p is not None and str(p) != ""]
+        if labels:
+            page_hint = f"Context pages (series page + next page scope): {', '.join(labels)}\n"
     return [
         {
             "role": "system",
             "content": (
                 "You are extracting HVAC product model names under a given brand/series. "
                 "Output concrete model identifiers only. "
+                "Only keep models that belong to the current series in the provided page scope. "
                 "Do not output series names, technologies, categories, or generic words. "
+                "Do not output accessory/optional/controller/panel/filter/module model codes as product models. "
                 "Preserve exact model spelling from the text."
             ),
         },
@@ -389,6 +480,7 @@ def build_model_messages(brand: str, series: str, text_block: str) -> List[Dict]
             "content": (
                 f"Brand: {brand or '<unknown>'}\n"
                 f"Series: {series or '<unknown>'}\n"
+                f"{page_hint}"
                 "Extract model names with evidence snippets and pages. "
                 "If none found, return empty models array.\n\n"
                 f"{text_block}"
@@ -520,6 +612,8 @@ def build_brand_global_filter_messages(candidates: List[Dict]) -> List[Dict]:
                 "Keep only true brands/manufacturers/trademarks. "
                 "Drop: series/line/model tokens and non-brand organization words, "
                 "institutes, departments, distributors, media, standards bodies. "
+                "Names that are mostly used as model prefixes or line abbreviations "
+                "(e.g., GMV/VRV/MULTI-V/CITY MULTI) should be dropped unless clear evidence shows they are manufacturer names. "
                 "If uncertain, prefer dropping to keep precision. "
                 "Return JSON with a 'keep' array of brand names to keep (can be empty)."
             ),
@@ -529,6 +623,38 @@ def build_brand_global_filter_messages(candidates: List[Dict]) -> List[Dict]:
             "content": (
                 "From the list below, choose the names that are actual brands/manufacturers/trademarks. "
                 "If none qualify, return an empty array.\n\n"
+                + "\n".join(lines)
+            ),
+        },
+    ]
+
+
+def build_brand_primary_messages(candidates: List[Dict]) -> List[Dict]:
+    """
+    Pick the primary manufacturer brand for one document.
+    """
+    lines = []
+    for idx, item in enumerate(candidates, 1):
+        evid = "; ".join(item.get("evidence", [])[:2])
+        lines.append(
+            f"{idx}. name={item.get('name','')} | pages={item.get('pages',0)} | evidence={evid}"
+        )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are selecting the primary manufacturer brand for one HVAC document. "
+                "Most single-product brochures have one manufacturer brand. "
+                "Return at most one name in keep[]. "
+                "Do not select series/line/model aliases as brand. "
+                "If multiple true brands appear, choose the manufacturer that owns most product context in this document."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Choose at most ONE primary manufacturer brand from candidates below. "
+                "Output JSON with keep array (0 or 1 item).\n\n"
                 + "\n".join(lines)
             ),
         },
@@ -583,7 +709,8 @@ def build_model_review_messages(
             "content": (
                 "You are verifying HVAC product model candidates. "
                 "For each name decide if it is a concrete product MODEL (keep=true) "
-                "vs series/line/other (keep=false). "
+                "vs series/line/accessory/other (keep=false). "
+                "Accessory means optional controller/panel/filter/module/kit model codes. "
                 "Also guess the closest product series/line name if the text reveals it "
                 "and leave it empty if uncertain. "
                 "If it clearly belongs to another series, set redirect_to and a confidence score 0-1. "
@@ -595,7 +722,7 @@ def build_model_review_messages(
             "content": (
                 f"Brand: {brand or '<unknown>'}\n"
                 f"Series: {series or '<unknown>'}\n"
-                "Label each candidate with kind in {model, series, other}, set keep=true only if it is a model, "
+                "Label each candidate with kind in {model, series, accessory, other}, set keep=true only if it is a model, "
                 "and fill series_guess/redirect_to/confidence when identifiable.\n\n"
                 f"{user_block}"
             ),
@@ -627,7 +754,9 @@ def build_product_review_messages(
                 "Return role ∈ {product, series_feature, accessory}: "
                 "- series_feature for series-level 功能/卖点/型号区间/标题; "
                 "- accessory for controllers/filters/etc.; "
-                "- product otherwise. Align keep/is_accessory/series_feature with role."
+                "- product otherwise. "
+                "If text is mainly describing optional accessory pairing (not an independent product row), use role=accessory. "
+                "Align keep/is_accessory/series_feature with role."
             ),
         },
         {

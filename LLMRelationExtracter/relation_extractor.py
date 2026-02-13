@@ -9,7 +9,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from openai import AsyncOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from backend.settings import RELATION_EXTRACTOR_CONFIG
 
@@ -77,11 +78,13 @@ RELATION_SCHEMA = {
 
 class RelationExtractor:
     def __init__(self) -> None:
-        self.client = AsyncOpenAI(
+        self.llm = ChatOpenAI(
             api_key=RELATION_EXTRACTOR_CONFIG["api_key"],
             base_url=RELATION_EXTRACTOR_CONFIG["base_url"],
+            model=RELATION_EXTRACTOR_CONFIG["model"],
+            temperature=0,
+            timeout=RELATION_EXTRACTOR_CONFIG["timeout"],
         )
-        self.model = RELATION_EXTRACTOR_CONFIG["model"]
         self.semaphore = asyncio.Semaphore(RELATION_EXTRACTOR_CONFIG["max_concurrent"])
         self.logger = self._setup_logging()
         self.system_prompt = RELATION_EXTRACTOR_CONFIG.get("system_prompt", "")
@@ -128,19 +131,26 @@ class RelationExtractor:
         async with self.semaphore:
             for attempt in range(RELATION_EXTRACTOR_CONFIG["max_retries"]):
                 try:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
+                    llm = self.llm.bind(
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "relation_schema",
+                                "schema": RELATION_SCHEMA,
+                                "strict": True,
+                            },
+                        }
+                    )
+                    response = await llm.ainvoke(
+                        [
+                            SystemMessage(
+                                content=(
                                     self.system_prompt
                                     or "You are a product information extraction expert. Only extract fields with evidence; if absent leave empty strings or empty arrays."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": (
+                                )
+                            ),
+                            HumanMessage(
+                                content=(
                                     "Extract product relations from the text below. "
                                     "IMPORTANT INSTRUCTIONS:\n"
                                     "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
@@ -150,26 +160,26 @@ class RelationExtractor:
                                     "- Do NOT merge specs across different models\n"
                                     "- Do NOT extract products that only appear in context pages\n\n"
                                     f"{text}"
-                                ),
-                            },
-                        ],
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "relation_schema",
-                                "schema": RELATION_SCHEMA,
-                                "strict": True,
-                            },
-                        },
-                        timeout=RELATION_EXTRACTOR_CONFIG["timeout"],
+                                )
+                            ),
+                        ]
                     )
 
-                    choices = getattr(response, "choices", None) or []
-                    if not choices:
-                        raise ValueError(f"Empty choices from model: {response}")
-
-                    message = getattr(choices[0], "message", None)
-                    content = getattr(message, "content", None)
+                    raw_content = getattr(response, "content", "")
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                    elif isinstance(raw_content, list):
+                        text_parts: List[str] = []
+                        for part in raw_content:
+                            if isinstance(part, dict):
+                                text = part.get("text")
+                                if isinstance(text, str):
+                                    text_parts.append(text)
+                            elif isinstance(part, str):
+                                text_parts.append(part)
+                        content = "".join(text_parts)
+                    else:
+                        content = str(raw_content or "")
                     if not content:
                         raise ValueError(f"Empty content from model: {response}")
 
