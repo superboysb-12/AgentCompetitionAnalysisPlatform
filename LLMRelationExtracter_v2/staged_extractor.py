@@ -17,12 +17,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from openai import AsyncOpenAI
+from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - fallback handled later
-    SentenceTransformer = None
 
 from backend.settings import RELATION_EXTRACTOR_CONFIG
 from LLMRelationExtracter import (  # v1 复用的通用模块
@@ -40,6 +36,7 @@ from .staged_prompts import (
     MODEL_SCHEMA,
     PRODUCT_REVIEW_SCHEMA,
     PRODUCT_SCHEMA,
+    SERIES_CANON_SCHEMA,
     SERIES_SCHEMA,
     SERIES_REVIEW_SCHEMA,
     build_brand_canon_messages,
@@ -50,6 +47,7 @@ from .staged_prompts import (
     build_model_review_messages,
     build_product_messages,
     build_product_review_messages,
+    build_series_canon_messages,
     build_series_review_messages,
     build_series_messages,
 )
@@ -83,24 +81,344 @@ def _dedup_list(seq: List) -> List:
 
 def _normalize_brand_key(text: str) -> str:
     """Stronger normalization for brand merge: remove spaces/punct and lowercase."""
-    return re.sub(r"[^a-z0-9\u4e00-\u9fa5]+", "", (text or "").lower())
+    return re.sub(r"[^a-z0-9一-龥]+", "", (text or "").lower())
 
 
 def _normalize_series_key(text: str) -> str:
     """Normalization for series merge/canonical matching."""
-    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fa5]+", "", (text or "").lower())
+    normalized = re.sub(r"[^a-z0-9一-龥]+", "", (text or "").lower())
     return normalized.replace("系列", "")
+
+
+_SERIES_META_KEYWORDS = (
+    "上一代",
+    "下一代",
+    "上一代产品",
+    "下一代产品",
+    "参数",
+    "对比",
+    "说明",
+    "介绍",
+    "通讯",
+    "通信",
+    "协议",
+    "网络",
+    "网关",
+    "控制",
+    "方案",
+    "最大框体",
+)
+_SERIES_PROTOCOL_KEYWORDS = (
+    "can网络",
+    "can总线",
+    "bacnet",
+    "modbus",
+    "knx",
+    "lonworks",
+    "协议",
+    "通讯",
+    "通信",
+    "网关",
+)
+_SERIES_GENERIC_NON_PRODUCT = (
+    "中央空调",
+    "空调",
+    "多联机",
+    "热泵",
+    "室内机",
+    "室外机",
+)
+_HVAC_SERIES_TAILS = (
+    "室内机",
+    "室外机",
+    "风管式",
+    "壁挂式",
+    "天井式",
+    "座吊式",
+    "多联机",
+    "机组",
+    "热泵",
+    "盘管",
+    "新风",
+)
+
+
+_SERIES_NARRATIVE_HINTS = (
+    "延续",
+    "继承",
+    "推出",
+    "先推",
+    "采用",
+    "相比",
+    "说明",
+    "引领",
+    "技术发展",
+    "发展方向",
+)
+
+
+def _clean_series_name_text(text: str) -> str:
+    """Normalize/clean noisy series candidate display text."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s:
+        return ""
+
+    s = re.sub(r"^\[title\]\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^[#*·\-\s]+", "", s)
+
+    # Drop bracketed meta notes (e.g., "(上一代产品)").
+    def _strip_meta_brackets(src: str) -> str:
+        out = src
+        bracket_patterns = [
+            r"\([^)]*\)",
+            r"（[^）]*）",
+            r"\[[^\]]*\]",
+            r"【[^】]*】",
+        ]
+        for pat in bracket_patterns:
+            while True:
+                m = re.search(pat, out)
+                if not m:
+                    break
+                token = m.group(0)
+                if any(k in token for k in _SERIES_META_KEYWORDS):
+                    out = out[: m.start()] + out[m.end() :]
+                else:
+                    break
+        return out
+
+    s = _strip_meta_brackets(s)
+
+    # Keep the first segment before enum-like separators: ① ② / 1) / 2.
+    s = re.split(r"[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]", s)[0]
+    s = re.split(r"\s+\d+\s*[).、．。:：]\s*", s)[0]
+
+    # Trim trailing explanatory words that are not part of a product series name.
+    s = re.sub(r"(使用|说明|参数|介绍|配置|功能|对比|方案|系统)\s*$", "", s)
+    s = s.strip(" ,，;；|/\\-:_")
+    return s
+
+
+def _looks_like_series_description_text(name: str) -> bool:
+    """
+    Detect long narrative/explanatory text that should not be used as canonical series name.
+    """
+    clean = _clean_series_name_text(name)
+    if not clean:
+        return False
+    compact = re.sub(r"\s+", "", clean)
+    if len(compact) < 10:
+        return False
+    if "..." in clean or "…" in clean:
+        return True
+    if re.search(r"[,，。;；:：!！?？]", clean):
+        return True
+    if len(compact) >= 22 and any(token in compact for token in _SERIES_NARRATIVE_HINTS):
+        return True
+    if len(compact) >= 30 and ("系列" in compact or "series" in compact.lower()):
+        if any(t in compact for t in _HVAC_SERIES_TAILS):
+            return True
+    return False
+
+
+def _is_hvac_series_candidate(name: str) -> bool:
+    """Check whether a candidate looks like a real HVAC product series/line."""
+    clean = _clean_series_name_text(name)
+    if not clean or len(clean) < 2 or len(clean) > 64:
+        return False
+
+    compact = re.sub(r"\s+", "", clean)
+    lower = compact.lower()
+    has_series_word = ("系列" in compact) or ("series" in lower)
+    has_code_prefix = bool(re.match(r"^[A-Za-z][A-Za-z0-9+\-]{1,23}", compact))
+    has_hvac_tail = any(t in compact for t in _HVAC_SERIES_TAILS)
+
+    if compact in _SERIES_GENERIC_NON_PRODUCT:
+        return False
+
+    if any(k in lower for k in _SERIES_PROTOCOL_KEYWORDS):
+        return False
+
+    # Meta/description-heavy text should not become canonical series names.
+    if any(k in compact for k in _SERIES_META_KEYWORDS):
+        if not has_code_prefix:
+            return False
+        if not has_series_word and not has_hvac_tail:
+            return False
+
+    if has_series_word:
+        return True
+    if has_code_prefix and has_hvac_tail:
+        return True
+    return False
+
+
+def _series_merge_key(text: str) -> str:
+    """
+    Key used for Stage-B alias merging.
+    It intentionally collapses variants like `SDZD` / `SDZD系列` / `SDZD系列...`.
+    """
+    cleaned = _clean_series_name_text(text)
+    raw = re.sub(r"[^a-z0-9一-龥]+", "", cleaned.lower())
+    if not raw:
+        return ""
+    if "系列" in raw:
+        prefix = raw.split("系列", 1)[0].strip()
+        if len(prefix) >= 2:
+            return prefix
+    code_prefix = re.match(r"^([a-z0-9+\-]{2,20})(?=[一-龥])", raw)
+    if code_prefix:
+        return code_prefix.group(1).strip("+-")
+    if raw.endswith("series") and len(raw) > len("series"):
+        return raw[: -len("series")]
+    return raw.replace("系列", "")
+
+
+def _choose_series_canonical_name(names: Sequence[str]) -> str:
+    """Pick a stable canonical display name from aliases of one merged series key."""
+    candidates = _dedup_list(
+        [
+            _clean_series_name_text(name)
+            for name in names
+            if _clean_series_name_text(name) and _is_hvac_series_candidate(name)
+        ]
+    )
+    if not candidates:
+        return ""
+    stable_candidates = [n for n in candidates if not _looks_like_series_description_text(n)]
+    if stable_candidates:
+        candidates = stable_candidates
+
+    def _score(name: str) -> Tuple[int, int, int, int, int, int]:
+        compact = re.sub(r"\s+", "", name)
+        lower = compact.lower()
+        has_series_word = int("系列" in compact or "series" in lower)
+        has_hvac_tail = int(any(t in compact for t in _HVAC_SERIES_TAILS))
+        noise_penalty = -sum(1 for k in _SERIES_META_KEYWORDS if k in compact)
+        description_penalty = -int(_looks_like_series_description_text(name))
+        has_chinese = int(bool(re.search(r"[一-龥]", compact)))
+        length_score = -abs(len(compact) - 14)
+        return (
+            has_series_word,
+            has_hvac_tail,
+            noise_penalty,
+            description_penalty,
+            has_chinese,
+            length_score,
+        )
+
+    return max(candidates, key=lambda n: (_score(n), n))
+
+
+def _split_series_name_candidates(name: str) -> List[str]:
+    """
+    Split noisy combined Stage-B series text into atomic series candidates.
+    Example:
+    "SDB系列... SDK系列... SDTS系列..." -> ["SDB系列...", "SDK系列...", "SDTS系列..."]
+    """
+    text = _clean_series_name_text(name)
+    text = text.strip(" ,;|/")
+    if not text:
+        return []
+
+    start_pattern = re.compile(r"(?:[A-Za-z0-9+\-]{2,20}|[一-龥]{1,8})\s*系列")
+    code_pattern = re.compile(r"(?:(?<=^)|(?<=[\s,;|/\\]))[A-Za-z0-9+\-]{2,20}(?:\s*系列)?(?=[一-龥])")
+    starts = sorted(
+        set([m.start() for m in start_pattern.finditer(text)] + [m.start() for m in code_pattern.finditer(text)])
+    )
+    if len(starts) <= 1:
+        return [text]
+
+    starts.append(len(text))
+    parts: List[str] = []
+    for idx in range(len(starts) - 1):
+        chunk = text[starts[idx] : starts[idx + 1]].strip(" ,;|/")
+        if len(chunk) >= 2:
+            parts.append(chunk)
+    return _dedup_list(parts) or [text]
+
+
+def _looks_like_code_series_name(name: str) -> bool:
+    """
+    Heuristic safety-net for Stage-B review:
+    preserve series candidates that clearly look like coded HVAC series labels.
+    """
+    compact = re.sub(r"\s+", "", _clean_series_name_text(name))
+    if len(compact) < 2:
+        return False
+
+    # e.g. SDTS系列..., GMV9系列..., SDC+系列...
+    if "系列" in compact:
+        prefix = compact.split("系列", 1)[0]
+        if 2 <= len(prefix) <= 24 and re.search(r"[A-Za-z]", prefix):
+            if re.fullmatch(r"[A-Za-z0-9+\-]+", prefix) and _is_hvac_series_candidate(compact):
+                return True
+
+    # e.g. SDTS?????????? (without explicit "系列")
+    if re.match(r"^[A-Za-z][A-Za-z0-9+\-]{1,23}[一-龥]", compact) and _is_hvac_series_candidate(compact):
+        return True
+
+    return False
+
+
+def _extract_code_series_from_text(text: str) -> List[str]:
+    """
+    Recover coded series names from noisy evidence snippets.
+    Used as a Stage-B supplement when LLM misses aliases in long rows.
+    """
+    source = re.sub(r"\s+", " ", str(text or ""))
+    if not source:
+        return []
+
+    patterns = [
+        re.compile(
+            r"[A-Za-z][A-Za-z0-9+\-]{1,23}\s*系列[^\n,，;；|]{0,28}?"
+            r"(?:室内机|室外机|盘管|机组|多联机)"
+        ),
+        re.compile(
+            r"[A-Za-z][A-Za-z0-9+\-]{1,23}[^\n,，;；|]{0,22}?"
+            r"(?:室内机|室外机|盘管|机组|多联机)"
+        ),
+    ]
+
+    found: List[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(source):
+            candidate = match.group(0).strip(" ,，;；|/\\")
+            if len(candidate) < 2 or len(candidate) > 56:
+                continue
+            for part in _split_series_name_candidates(candidate):
+                clean = _clean_series_name_text(part.strip(" ,，;；|/\\"))
+                if _looks_like_code_series_name(clean) and _is_hvac_series_candidate(clean):
+                    found.append(clean)
+    return _dedup_list(found)
+
+
+def _sanitize_series_items(series_items: List[Dict]) -> List[Dict]:
+    """Keep only HVAC product-series-like items and normalize their display names."""
+    out: List[Dict] = []
+    for item in series_items or []:
+        name = _clean_series_name_text(item.get("name") or "")
+        if not _is_hvac_series_candidate(name):
+            continue
+        cloned = dict(item or {})
+        cloned["name"] = name
+        cloned["evidence"] = _dedup_list(cloned.get("evidence", []))
+        cloned["pages"] = _dedup_list(cloned.get("pages", []))
+        out.append(cloned)
+    return out
 
 
 def _match_series_name(series_guess: str, brand: str, alias_map: Dict[str, Dict[str, List[str]]]) -> Optional[str]:
     "Return canonical series name within a brand if guess matches alias/canonical."
-    guess_key = _normalize_series_key(series_guess)
+    guess_key = _series_merge_key(series_guess) or _normalize_series_key(series_guess)
     if not guess_key:
         return None
     brand_map = alias_map.get(brand, {}) if alias_map else {}
     for canonical, aliases in brand_map.items():
         for name in [canonical] + aliases:
-            if _normalize_series_key(name) == guess_key:
+            name_key = _series_merge_key(name) or _normalize_series_key(name)
+            if name_key == guess_key:
                 return canonical
     return None
 
@@ -152,6 +470,25 @@ def _normalize_model_key(text: str) -> str:
     return _canonicalize_model_name(text)
 
 
+def _looks_like_non_model_value(text: str) -> bool:
+    """
+    Guardrail for Stage C:
+    drop numeric capacity values/ranges mistakenly extracted as model names.
+    """
+    token = str(text or "").strip()
+    if not token:
+        return True
+
+    lower = token.lower()
+    if re.fullmatch(r"\d+(?:\.\d+)?", lower):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:[/~\-]\d+(?:\.\d+)?)+", lower):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?\s*(?:kw|hp|匹)", lower):
+        return True
+    return False
+
+
 def _pair_key(brand: str, series: str) -> str:
     return f"{brand}|||{series}"
 
@@ -169,20 +506,17 @@ def _model_node_key(brand: str, series: str, model_name: str) -> str:
 
 @lru_cache(maxsize=2)
 def _get_embedder(model_name: str, device: str):
-    if SentenceTransformer is None:
-        raise ImportError("sentence-transformers not installed")
     return SentenceTransformer(model_name, device=device)
 
 
 def _get_concurrency(config: Dict, key: str, default: int) -> int:
     """
-    Unified concurrency resolver: prefer specific key, fallback to global_concurrency,
-    then to provided default.
+    Use one global concurrency for all LLM calls.
     """
-    if key in config and config[key] is not None:
-        return int(config[key])
     if "global_concurrency" in config and config["global_concurrency"] is not None:
         return int(config["global_concurrency"])
+    if "max_concurrent" in config and config["max_concurrent"] is not None:
+        return int(config["max_concurrent"])
     return int(default)
 
 
@@ -239,23 +573,33 @@ def _merge_brand_candidates(brands: List[Dict]) -> List[Dict]:
 
 def _merge_series_candidates(series_items: List[Dict]) -> List[Dict]:
     """Merge exact/near-exact series candidates by normalized key."""
+    series_items = _sanitize_series_items(series_items)
     merged: Dict[str, Dict] = {}
     for item in series_items:
-        name = (item.get("name") or "").strip()
-        key = _normalize_series_key(name)
-        if not key:
-            continue
-        if key not in merged:
-            merged[key] = {
-                "name": name,
-                "evidence": list(item.get("evidence", [])),
-                "pages": list(item.get("pages", [])),
-            }
-        else:
-            merged[key]["evidence"].extend(item.get("evidence", []))
-            merged[key]["pages"].extend(item.get("pages", []))
+        raw_name = (item.get("name") or "").strip()
+        for name in _split_series_name_candidates(raw_name):
+            clean_name = _clean_series_name_text(name)
+            if not _is_hvac_series_candidate(clean_name):
+                continue
+            key = _series_merge_key(clean_name) or _normalize_series_key(clean_name)
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = {
+                    "names": [clean_name],
+                    "evidence": list(item.get("evidence", [])),
+                    "pages": list(item.get("pages", [])),
+                }
+            else:
+                merged[key]["names"].append(clean_name)
+                merged[key]["evidence"].extend(item.get("evidence", []))
+                merged[key]["pages"].extend(item.get("pages", []))
     out: List[Dict] = []
     for value in merged.values():
+        candidate_names = _dedup_list(value.get("names", []))
+        canonical_name = _choose_series_canonical_name(candidate_names)
+        value["name"] = canonical_name or (candidate_names[0] if candidate_names else "")
+        value.pop("names", None)
         value["evidence"] = _dedup_list(value.get("evidence", []))
         value["pages"] = _dedup_list(value.get("pages", []))
         out.append(value)
@@ -303,11 +647,8 @@ def _merge_series_semantic(
     """Merge semantically close series aliases via multilingual embeddings."""
     if len(series_items) <= 1:
         return series_items
-    try:
-        names = [s.get("name", "") for s in series_items]
-        embeddings = _embed_texts(names, model_name, device=device)
-    except ImportError:
-        return series_items
+    names = [s.get("name", "") for s in series_items]
+    embeddings = _embed_texts(names, model_name, device=device)
 
     clusterer = AgglomerativeClustering(
         metric="cosine",
@@ -405,11 +746,8 @@ def _merge_translated_brands(
     """
     if len(brands) <= 1:
         return brands
-    try:
-        names = [b.get("name", "") for b in brands]
-        embeddings = _embed_texts(names, model_name, device=device)
-    except ImportError:
-        return brands
+    names = [b.get("name", "") for b in brands]
+    embeddings = _embed_texts(names, model_name, device=device)
 
     clusterer = AgglomerativeClustering(
         metric="cosine",
@@ -555,12 +893,6 @@ class StagedRelationExtractor:
         self.semaphore = asyncio.Semaphore(_get_concurrency(self.config, "max_concurrent", 5))
         self.timeout = self.config.get("timeout", 300)
         self.logger = self._setup_logger(log_name)
-        # feature toggles for composable pipeline
-        self.enable_brand_stage = self.config.get("enable_brand_stage", True)
-        self.enable_brand_cluster = self.config.get("enable_brand_cluster", True)
-        self.enable_series_stage = self.config.get("enable_series_stage", True)
-        self.enable_model_stage = self.config.get("enable_model_stage", True)
-        self.enable_product_stage = self.config.get("enable_product_stage", True)
         self.brand_alias_map: Dict[str, List[str]] = {}
         self.series_alias_map: Dict[str, Dict[str, List[str]]] = {}
         self.series_feature_map: Dict[str, Dict[str, List[Dict]]] = {}
@@ -763,11 +1095,8 @@ class StagedRelationExtractor:
         """
         if len(brands) <= 1:
             return [brands] if brands else []
-        try:
-            texts = [b.get("name", "") for b in brands]
-            embeddings = _embed_texts(texts, model_name, device=device)
-        except ImportError:
-            return [[b] for b in brands]
+        texts = [b.get("name", "") for b in brands]
+        embeddings = _embed_texts(texts, model_name, device=device)
 
         clusterer = AgglomerativeClustering(
             metric="cosine",
@@ -786,11 +1115,7 @@ class StagedRelationExtractor:
         Optional LLM-assisted brand pruning after recall-heavy extraction.
         Goal: reduce to canonical brands, not to fill gaps.
         """
-        if (
-            not brands
-            or not self.config.get("enable_brand_refine", True)
-            or len(brands) < int(self.config.get("brand_refine_min_count", 3))
-        ):
+        if not brands or len(brands) < int(self.config.get("brand_refine_min_count", 3)):
             return brands
 
         # prepare clusters by name similarity
@@ -900,9 +1225,8 @@ class StagedRelationExtractor:
             self.logger.error("Brand global filter failed: %s", exc)
 
         # canonicalize to Chinese brand form
-        if self.config.get("enable_brand_canon", True):
-            refined, alias_map = await self._canonicalize_brands(refined, error_log)
-            self.brand_alias_map = alias_map
+        refined, alias_map = await self._canonicalize_brands(refined, error_log)
+        self.brand_alias_map = alias_map
         return refined
 
     async def _canonicalize_brands(
@@ -980,9 +1304,9 @@ class StagedRelationExtractor:
         merged_list = list(merged.values())
         merged_list = _merge_brand_candidates(merged_list)
 
-        # optional clustered re-scan to boost recall
+        # clustered re-scan to boost recall
         cluster_size = int(self.config.get("brand_cluster_size", 5))
-        if self.enable_brand_cluster and cluster_size > 1:
+        if cluster_size > 1:
             cluster_mode = self.config.get("brand_cluster_mode", "fixed")
             clusters: List[Tuple[str, List]]
             if cluster_mode == "embed":
@@ -1028,15 +1352,11 @@ class StagedRelationExtractor:
 
     # -------------------------- Pipeline facades -------------------------- #
     async def run_brand_stage(self, pages: Sequence[Tuple[str, Dict]], error_log: Path) -> List[Dict]:
-        if not self.enable_brand_stage:
-            return []
         return await self.extract_brands(pages, error_log)
 
     async def run_series_stage(
         self, brands: List[Dict], pages: Sequence[Tuple[str, Dict]], error_log: Path
     ) -> Dict[str, List[Dict]]:
-        if not self.enable_series_stage:
-            return {b.get("name", ""): [] for b in brands}
         return await self.extract_series(brands, pages, error_log)
 
     async def run_model_stage(
@@ -1045,11 +1365,6 @@ class StagedRelationExtractor:
         pages: Sequence[Tuple[str, Dict]],
         error_log: Path,
     ) -> Dict[str, List[Dict]]:
-        if not self.enable_model_stage:
-            self.models_by_pair = {}
-            self.model_page_stats = {}
-            self.model_conflicts = {}
-            return {}
         model_map, model_pages = await self.extract_models(brand_to_series, pages, error_log)
         self.models_by_pair = model_map
         self.model_page_stats = model_pages
@@ -1061,8 +1376,6 @@ class StagedRelationExtractor:
         pages: Sequence[Tuple[str, Dict]],
         error_log: Path,
     ) -> List[Dict]:
-        if not self.enable_product_stage:
-            return []
         return await self.extract_products(brand_to_series, pages, error_log)
 
     # -------------------------- Stage B: series ---------------------------- #
@@ -1191,6 +1504,9 @@ class StagedRelationExtractor:
         """
         if not candidates:
             return [], {}
+        candidates = _sanitize_series_items(candidates)
+        if not candidates:
+            return [], {}
 
         payload = [
             {
@@ -1215,17 +1531,25 @@ class StagedRelationExtractor:
         # map by normalized original name for robust matching
         review_map: Dict[str, Dict] = {}
         for item in result.get("items", []):
-            key = _normalize_series_key(item.get("original", ""))
-            if key:
-                review_map[key] = item
+            original_name = item.get("original", "")
+            for key in (
+                _series_merge_key(original_name),
+                _normalize_series_key(original_name),
+            ):
+                if key:
+                    review_map[key] = item
 
         merged: Dict[str, Dict] = {}
         alias_map: Dict[str, List[str]] = {}
         dropped = 0
+        rescued = 0
         for series in candidates:
-            original = (series.get("name") or "").strip()
-            original_key = _normalize_series_key(original)
-            review = review_map.get(original_key)
+            original = _clean_series_name_text(series.get("name") or "")
+            if not _is_hvac_series_candidate(original):
+                dropped += 1
+                continue
+            original_key = _series_merge_key(original) or _normalize_series_key(original)
+            review = review_map.get(original_key) or review_map.get(_normalize_series_key(original))
 
             # Keep unmatched outputs to avoid accidental recall collapse.
             if review is None:
@@ -1233,56 +1557,237 @@ class StagedRelationExtractor:
                 keep_flag = True
             else:
                 keep_flag = bool(review.get("keep")) and review.get("kind") == "series"
-                canonical = (review.get("canonical") or original).strip()
+                canonical = _clean_series_name_text((review.get("canonical") or original).strip())
+                if not canonical:
+                    canonical = original
+
+            if not keep_flag and (_looks_like_code_series_name(original) or _looks_like_code_series_name(canonical)):
+                keep_flag = True
+                rescued += 1
 
             if not keep_flag:
                 dropped += 1
                 continue
 
-            canonical_key = _normalize_series_key(canonical)
+            canonical_key = _series_merge_key(canonical) or _normalize_series_key(canonical)
             if not canonical_key:
                 canonical = original
                 canonical_key = original_key
             if canonical_key not in merged:
                 merged[canonical_key] = {
-                    "name": canonical,
+                    "names": [canonical, original],
                     "evidence": list(series.get("evidence", [])),
                     "pages": list(series.get("pages", [])),
                 }
             else:
+                merged[canonical_key]["names"].extend([canonical, original])
                 merged[canonical_key]["evidence"].extend(series.get("evidence", []))
                 merged[canonical_key]["pages"].extend(series.get("pages", []))
-            alias_map.setdefault(canonical, []).append(original)
+
+        # Evidence-level supplement: recover coded sub-series hidden in long rows.
+        for series in candidates:
+            pages = list(series.get("pages", []))
+            for snippet in (series.get("evidence") or []):
+                for derived in _extract_code_series_from_text(str(snippet)):
+                    derived = _clean_series_name_text(derived)
+                    if not _is_hvac_series_candidate(derived):
+                        continue
+                    derived_key = _series_merge_key(derived) or _normalize_series_key(derived)
+                    if not derived_key:
+                        continue
+                    if derived_key not in merged:
+                        merged[derived_key] = {
+                            "names": [derived],
+                            "evidence": [str(snippet)],
+                            "pages": pages,
+                        }
+                    else:
+                        merged[derived_key]["names"].append(derived)
+                        merged[derived_key]["evidence"].append(str(snippet))
+                        merged[derived_key]["pages"].extend(pages)
 
         reviewed: List[Dict] = []
         for value in merged.values():
-            value["evidence"] = _dedup_list(value.get("evidence", []))
-            value["pages"] = _dedup_list(value.get("pages", []))
-            reviewed.append(value)
-        for name in alias_map:
-            alias_map[name] = _dedup_list(alias_map[name])
+            candidate_names = _dedup_list(
+                [
+                    _clean_series_name_text(name)
+                    for name in value.get("names", [])
+                    if _is_hvac_series_candidate(name)
+                ]
+            )
+            canonical_name = _choose_series_canonical_name(candidate_names)
+            if not canonical_name:
+                canonical_name = candidate_names[0] if candidate_names else ""
+            if not _is_hvac_series_candidate(canonical_name):
+                continue
+            item = {
+                "name": canonical_name,
+                "evidence": _dedup_list(value.get("evidence", [])),
+                "pages": _dedup_list(value.get("pages", [])),
+            }
+            reviewed.append(item)
+            if canonical_name:
+                alias_map[canonical_name] = candidate_names
 
         self.logger.info(
-            "Series review for brand=%s: candidates=%s dropped=%s kept=%s",
+            "Series review for brand=%s: candidates=%s dropped=%s rescued=%s kept=%s",
             brand,
             len(candidates),
             dropped,
+            rescued,
             len(reviewed),
         )
 
-        # Guardrail fallback when review is over-aggressive.
-        min_ratio = float(self.config.get("series_filter_min_keep_ratio", 0.3))
-        if candidates and (not reviewed or len(reviewed) < min_ratio * len(candidates)):
-            self.logger.warning(
-                "Series review kept %s/%s (< %.2f); fallback to pre-review candidates for brand=%s",
-                len(reviewed),
-                len(candidates),
-                min_ratio,
-                brand,
-            )
-            return candidates, {}
+        reviewed, alias_map = await self._canonicalize_series_groups_llm(
+            brand,
+            reviewed,
+            alias_map,
+            error_log,
+        )
 
         return reviewed, alias_map
+
+    async def _canonicalize_series_groups_llm(
+        self,
+        brand: str,
+        reviewed: List[Dict],
+        alias_map: Dict[str, List[str]],
+        error_log: Path,
+    ) -> Tuple[List[Dict], Dict[str, List[str]]]:
+        """
+        Stage-B second-pass canonicalization:
+        choose one stable canonical name per merged alias group via LLM.
+        """
+        if not reviewed:
+            return reviewed, alias_map or {}
+
+        group_meta: Dict[str, Dict] = {}
+        for item in reviewed:
+            name = _clean_series_name_text(item.get("name") or "")
+            if not _is_hvac_series_candidate(name):
+                continue
+            group_key = _series_merge_key(name) or _normalize_series_key(name)
+            if not group_key:
+                continue
+
+            aliases = [name] + list((alias_map or {}).get(name, []))
+            aliases = _dedup_list(
+                [
+                    _clean_series_name_text(alias)
+                    for alias in aliases
+                    if _clean_series_name_text(alias) and _is_hvac_series_candidate(alias)
+                ]
+            )
+            if not aliases:
+                aliases = [name]
+
+            evidence = _dedup_list(item.get("evidence", []))
+            pages = _dedup_list(item.get("pages", []))
+
+            if group_key not in group_meta:
+                group_meta[group_key] = {
+                    "aliases": aliases,
+                    "evidence": evidence,
+                    "pages": pages,
+                    "fallback_name": name,
+                }
+            else:
+                group_meta[group_key]["aliases"].extend(aliases)
+                group_meta[group_key]["evidence"].extend(evidence)
+                group_meta[group_key]["pages"].extend(pages)
+
+        if not group_meta:
+            return reviewed, alias_map or {}
+
+        groups_payload = [
+            {
+                "group_key": group_key,
+                "aliases": _dedup_list(meta.get("aliases", []))[:12],
+                "evidence": _dedup_list(meta.get("evidence", []))[:2],
+            }
+            for group_key, meta in group_meta.items()
+        ]
+
+        try:
+            result = await self._acall(
+                build_series_canon_messages(brand, groups_payload),
+                SERIES_CANON_SCHEMA,
+                "series_canon_schema",
+                {"brand": brand, "groups": len(groups_payload)},
+            )
+            canon_items = result.get("items", []) if isinstance(result, dict) else []
+        except Exception as exc:  # noqa: BLE001
+            _append_error(error_log, "series_canon", {"brand": brand}, exc)
+            self.logger.warning("Series canonicalization failed for brand %s: %s", brand, exc)
+            return reviewed, alias_map or {}
+
+        mapping: Dict[str, str] = {}
+        for row in canon_items:
+            group_key = _series_merge_key(row.get("group_key", "")) or _normalize_series_key(
+                row.get("group_key", "")
+            )
+            canonical = _clean_series_name_text(row.get("canonical", ""))
+            if group_key and canonical:
+                mapping[group_key] = canonical
+
+        merged: Dict[str, Dict] = {}
+        new_alias_map: Dict[str, List[str]] = {}
+
+        for group_key, meta in group_meta.items():
+            aliases = _dedup_list(meta.get("aliases", []))
+            canonical = mapping.get(group_key, "") or meta.get("fallback_name", "")
+            if canonical not in aliases:
+                canonical = meta.get("fallback_name", "") or canonical
+
+            canonical = _clean_series_name_text(canonical)
+            if (
+                not canonical
+                or not _is_hvac_series_candidate(canonical)
+                or _looks_like_series_description_text(canonical)
+            ):
+                canonical = _choose_series_canonical_name(aliases) or meta.get("fallback_name", "")
+            if not canonical or not _is_hvac_series_candidate(canonical):
+                continue
+
+            canonical_key = _series_merge_key(canonical) or _normalize_series_key(canonical) or group_key
+            bucket = merged.setdefault(
+                canonical_key,
+                {"name": canonical, "evidence": [], "pages": [], "aliases": []},
+            )
+            if bucket["name"] != canonical:
+                bucket["name"] = _choose_series_canonical_name([bucket["name"], canonical]) or bucket["name"]
+            bucket["evidence"].extend(meta.get("evidence", []))
+            bucket["pages"].extend(meta.get("pages", []))
+            bucket["aliases"].extend(aliases)
+
+        canonicalized: List[Dict] = []
+        for bucket in merged.values():
+            name = _clean_series_name_text(bucket.get("name", ""))
+            if not _is_hvac_series_candidate(name):
+                continue
+            evidence = _dedup_list(bucket.get("evidence", []))
+            pages = _dedup_list(bucket.get("pages", []))
+            canonicalized.append(
+                {
+                    "name": name,
+                    "evidence": evidence,
+                    "pages": pages,
+                }
+            )
+            aliases = _dedup_list(
+                [
+                    _clean_series_name_text(alias)
+                    for alias in bucket.get("aliases", [])
+                    if _clean_series_name_text(alias) and _is_hvac_series_candidate(alias)
+                ]
+            )
+            if name not in aliases:
+                aliases.insert(0, name)
+            new_alias_map[name] = aliases
+
+        if not canonicalized:
+            return reviewed, alias_map or {}
+        return canonicalized, new_alias_map or (alias_map or {})
 
     async def extract_series(
         self, brands: List[Dict], pages: Sequence[Tuple[str, Dict]], error_log: Path
@@ -1346,16 +1851,15 @@ class StagedRelationExtractor:
             # Stage-B candidate consolidation (similar to Stage-A: merge -> semantic merge -> LLM review)
             raw_series_list = _merge_series_candidates(raw_series_list)
 
-            if self.config.get("enable_series_semantic_merge", True):
-                raw_series_list = _merge_series_semantic(
-                    raw_series_list,
-                    model_name=self.config.get(
-                        "series_merge_embed_model",
-                        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                    ),
-                    distance_threshold=float(self.config.get("series_merge_threshold", 0.2)),
-                    device=self.config.get("series_merge_device", "cpu"),
-                )
+            raw_series_list = _merge_series_semantic(
+                raw_series_list,
+                model_name=self.config.get(
+                    "series_merge_embed_model",
+                    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                ),
+                distance_threshold=float(self.config.get("series_merge_threshold", 0.2)),
+                device=self.config.get("series_merge_device", "cpu"),
+            )
 
             series_list, alias_map = await self._review_series_for_brand(
                 brand_name,
@@ -1443,7 +1947,7 @@ class StagedRelationExtractor:
                 model_items.extend(chunk_models or [])
 
             merged_models = _merge_model_candidates(model_items)
-            if self.config.get("enable_model_llm_review", True) and merged_models:
+            if merged_models:
                 reviewed = await self._review_models_llm(brand, series, merged_models, error_log)
                 if reviewed:
                     merged_models = reviewed
@@ -1467,6 +1971,7 @@ class StagedRelationExtractor:
             return []
         max_items = int(self.config.get("product_review_max_items", 50))
         payload = products[:max_items]
+        untouched_tail = products[max_items:]
         try:
             result = await self._acall(
                 build_product_review_messages(brand, series, payload),
@@ -1475,24 +1980,34 @@ class StagedRelationExtractor:
                 {"brand": brand, "series": series, "count": len(payload)},
             )
             verdicts = {item.get("product_model", "").strip(): item for item in result.get("products", [])}
+            if not verdicts:
+                return products
             reviewed: List[Dict] = []
-            enable_series_feature = bool(self.config.get("series_feature_to_series", False))
             for prod in payload:
                 model_key = (prod.get("product_model") or "").strip()
-                category_key = (prod.get("category") or "").strip()
                 decision = verdicts.get(model_key)
                 if decision is None:
                     reviewed.append(prod)
                     continue
-                role = decision.get("role")
-                if role == "series_feature" and enable_series_feature:
+
+                role = (decision.get("role") or "").strip().lower()
+                if role not in {"product", "series_feature", "accessory"}:
+                    if decision.get("series_feature"):
+                        role = "series_feature"
+                    elif decision.get("is_accessory"):
+                        role = "accessory"
+                    else:
+                        role = "product"
+
+                if role == "series_feature":
                     self._store_series_feature(brand, series, prod, decision)
                     continue
                 if role == "accessory":
                     continue
-                if decision.get("keep") and role in (None, "product") and not decision.get("is_accessory"):
+                if decision.get("keep") and role == "product" and not decision.get("is_accessory"):
                     reviewed.append(prod)
-            return reviewed or products
+            reviewed.extend(untouched_tail)
+            return reviewed
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "product_review", {"brand": brand, "series": series}, exc)
             self.logger.warning("Product LLM review failed for %s/%s: %s", brand, series, exc)
@@ -1536,8 +2051,6 @@ class StagedRelationExtractor:
         """
         if not products:
             return []
-        if not self.config.get("product_model_must_from_stage_c", True):
-            return products
 
         known = _dedup_list(
             [
@@ -1547,7 +2060,7 @@ class StagedRelationExtractor:
             ]
         )
         if not known:
-            return products
+            return []
 
         norm_to_known: Dict[str, str] = {}
         for name in known:
@@ -1555,12 +2068,9 @@ class StagedRelationExtractor:
             if key and key not in norm_to_known:
                 norm_to_known[key] = name
         if not norm_to_known:
-            return products
+            return []
 
         sorted_norm_keys = sorted(norm_to_known.keys(), key=len, reverse=True)
-        drop_if_unknown = bool(self.config.get("product_model_drop_if_unknown", True))
-        expand_multi = bool(self.config.get("product_model_expand_multi_match", True))
-        match_in_evidence = bool(self.config.get("product_model_match_in_evidence", True))
         multi_cap = max(1, int(self.config.get("product_model_multi_match_cap", 12)))
 
         def _match(text: str) -> List[str]:
@@ -1577,34 +2087,25 @@ class StagedRelationExtractor:
         expanded = 0
         for product in products:
             matches = _match(product.get("product_model", ""))
-            if not matches and match_in_evidence:
-                evidence_text = " ".join(str(x) for x in (product.get("evidence") or []))
-                fact_text = " ".join(str(x) for x in (product.get("fact_text") or []))
-                for probe in (evidence_text, fact_text):
-                    matches = _match(probe)
-                    if matches:
-                        break
 
             if not matches:
-                if drop_if_unknown:
-                    dropped += 1
-                    continue
-                bound.append(product)
+                dropped += 1
                 continue
 
             if len(matches) > multi_cap:
                 matches = matches[:multi_cap]
 
-            if len(matches) > 1 and expand_multi:
+            if len(matches) > 1:
                 expanded += len(matches) - 1
                 for model_name in matches:
                     cloned = dict(product)
                     cloned["product_model"] = model_name
                     bound.append(cloned)
-            else:
-                canonical = dict(product)
-                canonical["product_model"] = matches[0]
-                bound.append(canonical)
+                continue
+
+            canonical = dict(product)
+            canonical["product_model"] = matches[0]
+            bound.append(canonical)
 
         if dropped or expanded:
             self.logger.info(
@@ -1630,6 +2131,7 @@ class StagedRelationExtractor:
             return []
         max_items = int(self.config.get("model_review_max_items", 80))
         payload = candidates[:max_items]
+        untouched_tail = candidates[max_items:]
         try:
             result = await self._acall(
                 build_model_review_messages(brand, series, payload),
@@ -1638,44 +2140,53 @@ class StagedRelationExtractor:
                 {"brand": brand, "series": series, "count": len(payload)},
             )
             verdicts = {item.get("name", "").strip(): item for item in result.get("items", [])}
+            if not verdicts:
+                return candidates
             reviewed: List[Dict] = []
             alias_map = getattr(self, "series_alias_map", {})
-            allow_redirect = bool(self.config.get("model_review_redirect", True))
-            drop_mismatch = bool(self.config.get("model_review_drop_mismatch", False))
+            allow_redirect = True
+            drop_mismatch = False
             redirect_conf = float(self.config.get("model_redirect_min_conf", 0.5))
             for cand in payload:
                 name = (cand.get("name") or "").strip()
                 decision = verdicts.get(name)
-                if decision and decision.get("keep") and decision.get("kind") == "model":
-                    series_guess = (decision.get("series_guess") or "").strip()
-                    redirect_to = (decision.get("redirect_to") or "").strip()
-                    conf = float(decision.get("confidence", 1.0) or 0)
-                    target_series = None
-                    if redirect_to:
-                        target_series = _match_series_name(redirect_to, brand, alias_map) or redirect_to
-                    elif series_guess:
-                        target_series = _match_series_name(series_guess, brand, alias_map)
-                        if not target_series and _normalize_series_key(series_guess) == _normalize_series_key(series):
-                            target_series = series
-                    if target_series and _normalize_series_key(target_series) != _normalize_series_key(series):
-                        if allow_redirect and conf >= redirect_conf:
-                            self.model_redirects.append(
-                                {
-                                    "brand": brand,
-                                    "source_series": series,
-                                    "target_series": target_series,
-                                    "model": cand,
-                                }
-                            )
-                            continue
-                        if drop_mismatch:
-                            continue
-                    elif not target_series and (redirect_to or series_guess) and drop_mismatch:
-                        # series hinted but cannot map confidently -> drop to avoid wrong assignment
-                        continue
+                if decision is None:
+                    # Keep unmatched candidate to avoid accidental over-prune.
                     reviewed.append(cand)
-            # fallback: avoid empty due to over-prune
-            return reviewed or candidates
+                    continue
+                if not (decision.get("keep") and decision.get("kind") == "model"):
+                    continue
+
+                series_guess = (decision.get("series_guess") or "").strip()
+                redirect_to = (decision.get("redirect_to") or "").strip()
+                conf = float(decision.get("confidence", 1.0) or 0)
+                target_series = None
+                if redirect_to:
+                    target_series = _match_series_name(redirect_to, brand, alias_map) or redirect_to
+                elif series_guess:
+                    target_series = _match_series_name(series_guess, brand, alias_map)
+                    if not target_series and _normalize_series_key(series_guess) == _normalize_series_key(series):
+                        target_series = series
+                if target_series and _normalize_series_key(target_series) != _normalize_series_key(series):
+                    if allow_redirect and conf >= redirect_conf:
+                        self.model_redirects.append(
+                            {
+                                "brand": brand,
+                                "source_series": series,
+                                "target_series": target_series,
+                                "model": cand,
+                            }
+                        )
+                        continue
+                    if drop_mismatch:
+                        continue
+                elif not target_series and (redirect_to or series_guess) and drop_mismatch:
+                    # series hinted but cannot map confidently -> drop to avoid wrong assignment
+                    continue
+                reviewed.append(cand)
+
+            reviewed.extend(untouched_tail)
+            return reviewed
         except Exception as exc:  # noqa: BLE001
             _append_error(error_log, "model_review", {"brand": brand, "series": series}, exc)
             self.logger.warning("Model LLM review failed for %s/%s: %s", brand, series, exc)
@@ -1811,19 +2322,18 @@ class StagedRelationExtractor:
 
         # Cross-series conflict resolution: same model under multiple series -> keep one owner.
         self.model_conflicts = {}
-        if self.config.get("enable_model_cross_series_resolve", True):
-            resolved_map, conflicts = _resolve_models_across_series(
-                models_by_pair,
-                brand_to_series,
-                model_page_stats,
+        resolved_map, conflicts = _resolve_models_across_series(
+            models_by_pair,
+            brand_to_series,
+            model_page_stats,
+        )
+        if conflicts:
+            self.logger.info(
+                "Stage C model conflict resolved: conflicts=%s",
+                len(conflicts),
             )
-            if conflicts:
-                self.logger.info(
-                    "Stage C model conflict resolved: conflicts=%s",
-                    len(conflicts),
-                )
-            models_by_pair = resolved_map
-            self.model_conflicts = conflicts
+        models_by_pair = resolved_map
+        self.model_conflicts = conflicts
 
         # write occurrence pages back into pair models for easier debugging/tracing
         for pair_key, model_list in models_by_pair.items():
@@ -1983,9 +2493,9 @@ class StagedRelationExtractor:
             series_pages: List,
         ) -> Tuple[int, List[Dict]]:
             try:
-                # Product stage context: model-hit pages + next N pages, not BM25 retrieval.
+                # Product stage context: model-hit pages + next N pages.
                 pair_models = self.models_by_pair.get(_pair_key(brand, series_name), [])
-                if self.enable_model_stage and not pair_models:
+                if not pair_models:
                     return pair_index, []
                 known_models = _dedup_list(
                     [
@@ -1994,135 +2504,83 @@ class StagedRelationExtractor:
                         if _canonicalize_model_name(model_item.get("name") or "")
                     ]
                 )
+                if not known_models:
+                    return pair_index, []
                 follow_after = int(self.config.get("model_context_follow_pages", 2))
-                use_target_mode = bool(self.config.get("stage_d_target_model_mode", True))
-
-                if use_target_mode and known_models:
-                    model_to_pages: Dict[str, List] = {}
-                    for model_item in pair_models:
-                        model_name = _canonicalize_model_name(model_item.get("name") or "")
-                        if not model_name:
-                            continue
-                        pages_hit = model_to_pages.setdefault(model_name, [])
-                        pages_hit.extend(self.model_page_stats.get(model_name, []))
-                        pages_hit.extend(model_item.get("pages", []))
-                    for model_name in list(model_to_pages.keys()):
-                        model_to_pages[model_name] = _dedup_list(
-                            [p for p in model_to_pages[model_name] if p is not None and str(p) != ""]
-                        )
-
-                    model_sem = asyncio.Semaphore(
-                        max(1, _get_concurrency(self.config, "product_model_concurrency", 6))
+                model_to_pages: Dict[str, List] = {}
+                for model_item in pair_models:
+                    model_name = _canonicalize_model_name(model_item.get("name") or "")
+                    if not model_name:
+                        continue
+                    pages_hit = model_to_pages.setdefault(model_name, [])
+                    pages_hit.extend(self.model_page_stats.get(model_name, []))
+                    pages_hit.extend(model_item.get("pages", []))
+                for model_name in list(model_to_pages.keys()):
+                    model_to_pages[model_name] = _dedup_list(
+                        [p for p in model_to_pages[model_name] if p is not None and str(p) != ""]
                     )
 
-                    async def _run_model(model_name: str) -> List[Dict]:
-                        async with model_sem:
-                            model_pages = model_to_pages.get(model_name, [])
-                            if not model_pages and series_pages:
-                                model_pages = _dedup_list(series_pages)
-                            if not model_pages:
-                                return []
-                            model_relevant_pages = _select_pages_by_numbers_with_following(
-                                pages,
-                                model_pages,
-                                follow_after=follow_after,
-                            )
-                            if not model_relevant_pages:
-                                return []
-                            text_block = _combine_pages(model_relevant_pages, self.config)
-                            page_refs = [meta.get("page") for _, meta in model_relevant_pages]
-                            extracted = await self._extract_products_for_pair(
-                                brand,
-                                series_name,
-                                text_block,
-                                page_refs,
-                                [model_name],
-                                error_log,
-                                target_model=model_name,
-                            )
-                            processed_model = list(extracted)
-                            if self.config.get("enable_product_llm_review", True) and processed_model:
-                                processed_model = await self._review_products_llm(
-                                    brand,
-                                    series_name,
-                                    processed_model,
-                                    error_log,
-                                )
-                            processed_model = self._bind_products_to_known_models(
+                model_sem = asyncio.Semaphore(
+                    max(1, _get_concurrency(self.config, "product_model_concurrency", 6))
+                )
+
+                async def _run_model(model_name: str) -> List[Dict]:
+                    async with model_sem:
+                        model_pages = model_to_pages.get(model_name, [])
+                        if not model_pages and series_pages:
+                            model_pages = _dedup_list(series_pages)
+                        if not model_pages:
+                            return []
+                        model_relevant_pages = _select_pages_by_numbers_with_following(
+                            pages,
+                            model_pages,
+                            follow_after=follow_after,
+                        )
+                        if not model_relevant_pages:
+                            return []
+                        text_block = _combine_pages(
+                            model_relevant_pages,
+                            self.config,
+                            target_model=model_name,
+                        )
+                        page_refs = [meta.get("page") for _, meta in model_relevant_pages]
+                        extracted = await self._extract_products_for_pair(
+                            brand,
+                            series_name,
+                            text_block,
+                            page_refs,
+                            [model_name],
+                            error_log,
+                            target_model=model_name,
+                        )
+                        processed_model = list(extracted)
+                        if processed_model:
+                            processed_model = await self._review_products_llm(
                                 brand,
                                 series_name,
                                 processed_model,
-                                [model_name],
+                                error_log,
                             )
-                            return _deduplicate_products_by_model(processed_model, self.config)
+                        processed_model = self._bind_products_to_known_models(
+                            brand,
+                            series_name,
+                            processed_model,
+                            [model_name],
+                        )
+                        return _deduplicate_products_by_model(processed_model, self.config)
 
-                    model_tasks = [asyncio.create_task(_run_model(model_name)) for model_name in known_models]
-                    model_products: List[Dict] = []
-                    for mt in asyncio.as_completed(model_tasks):
-                        model_products.extend(await mt)
-                    model_products = _deduplicate_products_by_model(model_products, self.config)
-                    model_products = self._bind_products_to_known_models(
-                        brand,
-                        series_name,
-                        model_products,
-                        known_models,
-                    )
-                    return pair_index, model_products
-
-                # Fallback legacy pair-level extraction path.
-                model_hit_pages: List = []
-                for model_name in known_models:
-                    model_hit_pages.extend(self.model_page_stats.get(model_name, []))
-                if not model_hit_pages:
-                    for model_item in pair_models:
-                        model_hit_pages.extend(model_item.get("pages", []))
-                if not model_hit_pages and series_pages:
-                    model_hit_pages.extend(series_pages)
-
-                relevant_pages = _select_pages_by_numbers_with_following(
-                    pages,
-                    _dedup_list(model_hit_pages),
-                    follow_after=follow_after,
-                )
-                if not relevant_pages and series_pages:
-                    relevant_pages = _select_pages_by_numbers_with_following(
-                        pages,
-                        _dedup_list(series_pages),
-                        follow_after=follow_after,
-                    )
-                if not relevant_pages:
-                    self.logger.warning(
-                        "Stage D: no context pages for brand=%s series=%s; skip pair to avoid noise",
-                        brand,
-                        series_name,
-                    )
-                    return pair_index, []
-                text_block = _combine_pages(relevant_pages, self.config)
-                page_refs = [meta.get("page") for _, meta in relevant_pages]
-                extracted = await self._extract_products_for_pair(
+                model_tasks = [asyncio.create_task(_run_model(model_name)) for model_name in known_models]
+                model_products: List[Dict] = []
+                for mt in asyncio.as_completed(model_tasks):
+                    model_products.extend(await mt)
+                model_products = _deduplicate_products_by_model(model_products, self.config)
+                model_products = self._bind_products_to_known_models(
                     brand,
                     series_name,
-                    text_block,
-                    page_refs,
-                    known_models,
-                    error_log,
-                    target_model=None,
-                )
-                processed = list(extracted)
-                if self.config.get("enable_product_llm_review", True) and processed:
-                    processed = await self._review_products_llm(
-                        brand,
-                        series_name,
-                        processed,
-                        error_log,
-                    )
-                processed = self._bind_products_to_known_models(
-                    brand,
-                    series_name,
-                    processed,
+                    model_products,
                     known_models,
                 )
-                return pair_index, processed
+                return pair_index, model_products
             except Exception as exc:  # noqa: BLE001
                 _append_error(
                     error_log,
@@ -2175,19 +2633,11 @@ class StagedRelationExtractor:
         self._show_progress = show_progress
         brands = await self.run_brand_stage(pages, error_log)
         if not brands:
-            self.logger.warning("No brands found; fallback to whole-document extraction.")
-            brands = [{"name": "", "evidence": [], "pages": []}]
+            return []
 
         brand_to_series = await self.run_series_stage(brands, pages, error_log)
         await self.run_model_stage(brand_to_series, pages, error_log)
         products = await self.run_product_stage(brand_to_series, pages, error_log)
-
-        if not products:
-            self.logger.warning("No products extracted; emitting doc-level fallback.")
-            fallback = self._ensure_product_defaults(_default_product_template(), "", "", [])
-            fallback["product_model"] = "UNKNOWN_MODEL"
-            products = [fallback]
-
         return products
 
     # -------------------------- Post-processing helpers ------------------- #
@@ -2233,6 +2683,9 @@ class StagedRelationExtractor:
 
         # Canonicalize model format (e.g., full-width chars, spaces, combo '+').
         merged["product_model"] = _canonicalize_model_name(merged.get("product_model", ""))
+        merged["performance_specs"] = _normalize_performance_specs(
+            merged.get("performance_specs") or []
+        )
 
         # Dedup any repeated page_refs in evidence string hints
         merged["evidence"] = _dedup_list(merged.get("evidence", []))
@@ -2252,7 +2705,7 @@ def _select_pages_by_keywords(
     min_hits: int = 1,
     match_mode: str = "any",
 ) -> List[Tuple[str, Dict]]:
-    """Keyword retrieval with hit-count ranking; fallback to all pages when no match."""
+    """Keyword retrieval with hit-count ranking."""
     lowered = _dedup_list([str(k).strip().lower() for k in keywords if str(k).strip()])
     if not lowered:
         return list(pages)
@@ -2272,7 +2725,7 @@ def _select_pages_by_keywords(
             ranked.append((hit_count, idx, page))
 
     if not ranked:
-        return list(pages)
+        return []
 
     ranked.sort(key=lambda item: (-item[0], item[1]))
     selected = [page for _, _, page in ranked]
@@ -2281,11 +2734,96 @@ def _select_pages_by_keywords(
     return selected
 
 
+def _parse_bbox_like(value) -> Optional[Tuple[float, float, float, float]]:
+    if isinstance(value, (list, tuple)) and len(value) >= 4:
+        nums = value
+    else:
+        nums = re.findall(r"-?\d+(?:\.\d+)?", str(value or ""))
+    if len(nums) < 4:
+        return None
+    try:
+        x1, y1, x2, y2 = float(nums[0]), float(nums[1]), float(nums[2]), float(nums[3])
+    except Exception:
+        return None
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _row_inside_table_bbox(
+    row_bbox: Optional[Tuple[float, float, float, float]],
+    table_bboxes: List[Tuple[float, float, float, float]],
+    min_cover_ratio: float = 0.85,
+) -> bool:
+    if not row_bbox or not table_bboxes:
+        return False
+    rx1, ry1, rx2, ry2 = row_bbox
+    row_area = max((rx2 - rx1) * (ry2 - ry1), 1e-6)
+    for tx1, ty1, tx2, ty2 in table_bboxes:
+        ix1 = max(rx1, tx1)
+        iy1 = max(ry1, ty1)
+        ix2 = min(rx2, tx2)
+        iy2 = min(ry2, ty2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        overlap = (ix2 - ix1) * (iy2 - iy1)
+        if overlap / row_area >= min_cover_ratio:
+            return True
+    return False
+
+
+def _normalize_rows_match_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def _filter_rows_for_rows_json(rows_list: List[Dict], config: Optional[Dict]) -> List[Dict]:
+    if not rows_list:
+        return []
+    return list(rows_list)
+
+
+def _compact_row_for_rows_json(row: Dict, config: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(row, dict):
+        return None
+
+    clip_chars = int((config or {}).get("rows_json_content_clip", 2400))
+    row_type = str(row.get("type", "")).lower()
+
+    compact: Dict = {"type": row.get("type", "")}
+    if row.get("bbox"):
+        compact["bbox"] = row.get("bbox")
+    if row.get("page") is not None and str(row.get("page")) != "":
+        compact["page"] = row.get("page")
+
+    content = str(row.get("content", "")).strip()
+    table_data = str(row.get("table_data", "")).strip()
+
+    if row_type == "table":
+        if table_data:
+            compact["table_data"] = table_data[:clip_chars] if clip_chars > 0 else table_data
+        elif content:
+            compact["content"] = content[:clip_chars] if clip_chars > 0 else content
+    else:
+        if content:
+            compact["content"] = content[:clip_chars] if clip_chars > 0 else content
+        if table_data and row_type not in {"title", "text", "list"}:
+            compact["table_data"] = table_data[:clip_chars] if clip_chars > 0 else table_data
+
+    if "content" not in compact and "table_data" not in compact:
+        return None
+    return compact
+
+
 def _render_rows_blocks(rows, config: Optional[Dict]) -> List[str]:
     try:
         rows_list = list(rows) if isinstance(rows, (list, tuple)) else [rows]
     except Exception:
         rows_list = [rows]
+    rows_list = _filter_rows_for_rows_json(rows_list, config)
     rows_per_block = max(1, int(config.get("table_rows_per_block", 10))) if config else 10
     max_cell_len = int(config.get("table_row_cell_clip", 0)) if config else 0
     blocks: List[str] = []
@@ -2293,10 +2831,13 @@ def _render_rows_blocks(rows, config: Optional[Dict]) -> List[str]:
         block_rows = rows_list[i : i + rows_per_block]
         rendered = []
         for r in block_rows:
+            row_payload = _compact_row_for_rows_json(r, config)
+            if row_payload is None:
+                continue
             try:
-                row_str = json.dumps(r, ensure_ascii=False)
+                row_str = json.dumps(row_payload, ensure_ascii=False)
             except Exception:
-                row_str = str(r)
+                row_str = str(row_payload)
             if max_cell_len and len(row_str) > max_cell_len:
                 row_str = row_str[:max_cell_len] + "..."
             rendered.append(row_str)
@@ -2305,33 +2846,139 @@ def _render_rows_blocks(rows, config: Optional[Dict]) -> List[str]:
     return blocks
 
 
-def _combine_pages(pages: Sequence[Tuple[str, Dict]], config: Optional[Dict] = None) -> str:
+def _rows_to_prompt_text(rows_list: List[Dict]) -> str:
+    prefix_map = {
+        "title": "[title]",
+        "text": "[text]",
+        "list": "[text]",
+        "table": "[table]",
+    }
+    parts: List[str] = []
+    for row in rows_list or []:
+        row_type = str(row.get("type", "")).lower()
+        content = str(row.get("content", "")).strip()
+        table_data = str(row.get("table_data", "")).strip()
+        if row_type == "table" and table_data:
+            table_lines = table_data.replace(" \\n ", "\n").replace("\\n", "\n")
+            lines = [
+                f"[table_row] {line.strip()}"
+                for line in table_lines.splitlines()
+                if line.strip()
+            ]
+            if lines:
+                parts.append("\n".join(lines))
+            continue
+        if content:
+            parts.append(f"{prefix_map.get(row_type, '[block]')} {content}")
+    return "\n\n".join(parts)
+
+
+def _slice_table_data_for_target_model(
+    table_data: str,
+    target_model: str,
+    context_lines: int = 0,
+) -> str:
+    lines = [line.strip() for line in str(table_data or "").replace(" \\n ", "\n").replace("\\n", "\n").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    target_key = _normalize_model_key(target_model)
+    if not target_key:
+        return "\n".join(lines)
+
+    normalized = [_normalize_model_key(line) for line in lines]
+    hit_indices = [idx for idx, norm in enumerate(normalized) if target_key in norm]
+    if not hit_indices:
+        return "\n".join(lines)
+
+    keep = set()
+    # Keep top header rows and target rows with neighbors.
+    for idx in range(min(2, len(lines))):
+        keep.add(idx)
+    for idx in hit_indices:
+        left = max(0, idx - max(0, int(context_lines)))
+        right = min(len(lines), idx + max(0, int(context_lines)) + 1)
+        for j in range(left, right):
+            keep.add(j)
+
+    return "\n".join(lines[idx] for idx in sorted(keep))
+
+
+def _filter_rows_for_target_model(
+    rows_list: List[Dict],
+    target_model: Optional[str],
+    context_lines: int = 0,
+) -> Tuple[List[Dict], bool]:
+    if not rows_list or not target_model:
+        return rows_list, False
+    target_key = _normalize_model_key(target_model)
+    if not target_key:
+        return rows_list, False
+
+    filtered: List[Dict] = []
+    hit_any = False
+    for row in rows_list:
+        row_type = str(row.get("type", "")).lower()
+        if row_type != "table":
+            filtered.append(row)
+            continue
+
+        table_data = str(row.get("table_data", "")).strip()
+        if not table_data:
+            continue
+        if target_key not in _normalize_model_key(table_data):
+            continue
+
+        sliced_table_data = _slice_table_data_for_target_model(
+            table_data,
+            target_model,
+            context_lines=context_lines,
+        )
+        cloned = dict(row)
+        cloned["table_data"] = sliced_table_data
+        # Avoid re-injecting full-table flattened content.
+        cloned["content"] = ""
+        filtered.append(cloned)
+        hit_any = True
+
+    return (filtered, True) if hit_any else (rows_list, False)
+
+
+def _combine_pages(
+    pages: Sequence[Tuple[str, Dict]],
+    config: Optional[Dict] = None,
+    target_model: Optional[str] = None,
+) -> str:
     chunks = []
     for text, meta in pages:
         page = meta.get("page", "")
-        chunk = [f"<<PAGE {page}>>", text]
+        page_text = text
+        chunk = [f"<<PAGE {page}>>"]
         rows = meta.get("rows")
         if rows:
-            row_blocks: List[str] = []
-            if config and config.get("table_row_exhaust_mode", False):
-                row_blocks = _render_rows_blocks(rows, config)
-            else:
-                try:
-                    clip_chars = (
-                        int(config.get("table_rows_clip_chars", 4000)) if config else 4000
-                    )
-                except Exception:
-                    clip_chars = 4000
-                try:
-                    raw_rows = json.dumps(rows, ensure_ascii=False)
-                    if clip_chars and clip_chars > 0:
-                        raw_rows = raw_rows[:clip_chars]
-                    row_blocks = [raw_rows]
-                except Exception:
-                    row_blocks = []
+            try:
+                rows_list = list(rows) if isinstance(rows, (list, tuple)) else [rows]
+            except Exception:
+                rows_list = [rows]
+            rows_payload = _filter_rows_for_rows_json(rows_list, config)
+            target_hit = False
+            if target_model:
+                rows_payload, target_hit = _filter_rows_for_target_model(
+                    rows_payload,
+                    target_model=target_model,
+                    context_lines=int((config or {}).get("target_model_table_context_lines", 0)),
+                )
+                if target_hit:
+                    filtered_text = _rows_to_prompt_text(rows_payload)
+                    if filtered_text:
+                        page_text = filtered_text
+            chunk.append(page_text)
+            row_blocks: List[str] = _render_rows_blocks(rows_payload, config)
             for block in row_blocks:
                 chunk.append("[rows_json]")
                 chunk.append(block)
+        else:
+            chunk.append(page_text)
         chunks.append("\n".join(chunk))
     return "\n\n".join(chunks)
 
@@ -2732,8 +3379,258 @@ def _build_model_specs_relations(products: Sequence[Dict]) -> List[Dict]:
     return list(grouped.values())
 
 
+_SPEC_EN_NAME_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bstandard\s*static\s*pressure\b", flags=re.IGNORECASE), "标准静压"),
+    (re.compile(r"\bstatic\s*pressure\s*range\b", flags=re.IGNORECASE), "静压范围"),
+    (re.compile(r"\bstatic\s*pressure\b", flags=re.IGNORECASE), "静压"),
+    (
+        re.compile(
+            r"\b(?:air\s*flow|airflow|circulating\s*air\s*volume|cycle\s*air\s*volume)\b",
+            flags=re.IGNORECASE,
+        ),
+        "循环风量",
+    ),
+    (re.compile(r"\bcooling\s*capacity\b", flags=re.IGNORECASE), "制冷量"),
+    (re.compile(r"\bheating\s*capacity\b", flags=re.IGNORECASE), "制热量"),
+    (
+        re.compile(r"\bcooling\s*(?:input\s*power|power\s*consumption|power)\b", flags=re.IGNORECASE),
+        "制冷功率",
+    ),
+    (
+        re.compile(r"\bheating\s*(?:input\s*power|power\s*consumption|power)\b", flags=re.IGNORECASE),
+        "制热功率",
+    ),
+    (re.compile(r"\b(?:input\s*power|power\s*consumption)\b", flags=re.IGNORECASE), "耗电量"),
+    (re.compile(r"\b(?:noise|sound\s*pressure)\b", flags=re.IGNORECASE), "噪音"),
+    (re.compile(r"\b(?:power\s*supply|voltage)\b", flags=re.IGNORECASE), "电源"),
+    (re.compile(r"\bfrequency\b", flags=re.IGNORECASE), "频率"),
+    (re.compile(r"\bdrain\s*pipe\b", flags=re.IGNORECASE), "排水管"),
+    (re.compile(r"\bdrainage\s*pipe\b", flags=re.IGNORECASE), "排水管"),
+    (re.compile(r"\bnet\s*weight\b", flags=re.IGNORECASE), "净重"),
+    (re.compile(r"\bgross\s*weight\b", flags=re.IGNORECASE), "毛重"),
+    (re.compile(r"\boperating\s*weight\b", flags=re.IGNORECASE), "运行重量"),
+    (re.compile(r"\bweight\b", flags=re.IGNORECASE), "重量"),
+    (re.compile(r"\bdimension(?:s)?\b", flags=re.IGNORECASE), "外形尺寸"),
+    (re.compile(r"\bconnection\s*method\b", flags=re.IGNORECASE), "连接方式"),
+    (re.compile(r"\bprotection\s*(?:grade|level)\b", flags=re.IGNORECASE), "防护等级"),
+    (re.compile(r"\bfuse\s*current\b", flags=re.IGNORECASE), "保险丝电流"),
+    (re.compile(r"\bcircuit\s*breaker\s*capacity\b", flags=re.IGNORECASE), "断路器容量"),
+    (re.compile(r"\bpanel\s*model\b", flags=re.IGNORECASE), "面板型号"),
+    (re.compile(r"\bpanel\s*weight\b", flags=re.IGNORECASE), "面板重量"),
+    (re.compile(r"\brefrigerant\s*charge\b", flags=re.IGNORECASE), "冷媒充注量"),
+    (re.compile(r"\bpipe\s*diameter\b", flags=re.IGNORECASE), "管径"),
+    (re.compile(r"\bcoil\s*water\s*flow\b", flags=re.IGNORECASE), "盘管水流量"),
+    (re.compile(r"\brated\s*power\s*cooling\b", flags=re.IGNORECASE), "额定制冷功率"),
+    (re.compile(r"\brated\s*power\s*heating\b", flags=re.IGNORECASE), "额定制热功率"),
+    (re.compile(r"\bpower\s*input\b", flags=re.IGNORECASE), "输入功率"),
+    (re.compile(r"^power$", flags=re.IGNORECASE), "功率"),
+    (re.compile(r"^hp$", flags=re.IGNORECASE), "匹数"),
+    (
+        re.compile(
+            r"\b(?:optional\s*)?(?:electric\s*)?auxiliary(?:\s*electric)?\s*heating\b",
+            flags=re.IGNORECASE,
+        ),
+        "可选电辅热功率",
+    ),
+)
+
+_SPEC_EN_GAS_PIPE_RULE = re.compile(
+    r"(?:connection|connecting)?\s*pipe.*\bgas\b|\bgas\b.*(?:connection|connecting)?\s*pipe",
+    flags=re.IGNORECASE,
+)
+_SPEC_EN_LIQUID_PIPE_RULE = re.compile(
+    r"(?:connection|connecting)?\s*pipe.*\bliquid\b|\bliquid\b.*(?:connection|connecting)?\s*pipe",
+    flags=re.IGNORECASE,
+)
+_SPEC_EN_APF_RULE = re.compile(r"\bapf\b", flags=re.IGNORECASE)
+_SPEC_EN_COP_RULE = re.compile(r"\bcop\b", flags=re.IGNORECASE)
+_SPEC_EN_EER_RULE = re.compile(r"\beer\b", flags=re.IGNORECASE)
+
+_SPEC_CN_CANONICAL_MAP: Dict[str, str] = {
+    "外机静压": "机外静压",
+    "最高机外静压": "机外静压",
+    "机外静压范围": "静压范围",
+    "标准机外静压": "标准静压",
+}
+
+_SPEC_RAW_HINTS: Tuple[str, ...] = (
+    "标准静压",
+    "静压范围",
+    "机外静压",
+    "静压",
+    "循环风量",
+    "风量",
+    "制冷量",
+    "制热量",
+    "制冷功率",
+    "制热功率",
+    "耗电量",
+    "噪音",
+    "电源",
+    "连接管",
+    "排水管",
+    "外形尺寸",
+    "净重",
+    "毛重",
+)
+
+_SPEC_RAW_NAME_KEYWORDS: Tuple[str, ...] = (
+    "压",
+    "量",
+    "功率",
+    "电流",
+    "风量",
+    "噪音",
+    "电源",
+    "频率",
+    "尺寸",
+    "重量",
+    "管",
+    "能效",
+    "温度",
+)
+
+_SPEC_RAW_NAME_STOPWORDS: Tuple[str, ...] = (
+    "型号",
+    "产品",
+    "系列",
+    "机组",
+    "备注",
+    "说明",
+    "参数",
+)
+
+
+def _localize_hml_tokens(name: str) -> str:
+    if not name:
+        return ""
+    out = name
+    replacements = (
+        (r"\(H/M/L\)", "(高/中/低)"),
+        (r"\(H/ML\)", "(高/中低)"),
+        (r"\(HML\)", "(高中低)"),
+        (r"\(H/W/L\)", "(高/强/低)"),
+        (r"\(H\)", "(高)"),
+        (r"\(M\)", "(中)"),
+        (r"\(L\)", "(低)"),
+        (r"\bH/M/L\b", "高/中/低"),
+        (r"\bH/ML\b", "高/中低"),
+        (r"\bHigh\b", "高"),
+        (r"\bMedium\b", "中"),
+        (r"\bLow\b", "低"),
+        (r"_High\b", "_高"),
+        (r"_Medium\b", "_中"),
+        (r"_Low\b", "_低"),
+        (r"_H\b", "_高"),
+        (r"_M\b", "_中"),
+        (r"_L\b", "_低"),
+    )
+    for pattern, new in replacements:
+        out = re.sub(pattern, new, out, flags=re.IGNORECASE)
+    return out
+
+
+def _canonicalize_cn_spec_name(name: str) -> str:
+    clean = re.sub(r"\s+", "", str(name or ""))
+    clean = _SPEC_CN_CANONICAL_MAP.get(clean, clean)
+    clean = re.sub(r"(?<=[0-9一-龥)])x(?=[0-9一-龥(])", "×", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bW[×x]D[×x]H\b", "宽×深×高", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bW[×x]H[×x]D\b", "宽×高×深", clean, flags=re.IGNORECASE)
+    if any(token in clean for token in ("风量", "噪音", "噪声", "规格")):
+        clean = _localize_hml_tokens(clean)
+    return clean
+
+
+def _infer_cn_spec_name_from_raw(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+
+    for hint in _SPEC_RAW_HINTS:
+        if hint in compact:
+            return _canonicalize_cn_spec_name(hint)
+
+    matched = re.search(r"([一-龥]{2,16})\s*(?:[:：]|[0-9])", text)
+    if not matched:
+        return ""
+    candidate = _canonicalize_cn_spec_name(matched.group(1))
+    if any(token in candidate for token in _SPEC_RAW_NAME_STOPWORDS):
+        return ""
+    if any(token in candidate for token in _SPEC_RAW_NAME_KEYWORDS):
+        return candidate
+    return ""
+
+
+def _canonicalize_spec_name(name: str, raw: str) -> str:
+    original = str(name or "").strip()
+    if not original:
+        return _infer_cn_spec_name_from_raw(raw)
+
+    clean = re.sub(r"\s+", " ", original).strip(" :：;；,，")
+    if re.search(r"[一-龥]", clean):
+        return _canonicalize_cn_spec_name(clean)
+
+    normalized = re.sub(r"[_\-]+", " ", clean)
+    lower = normalized.lower()
+
+    if _SPEC_EN_GAS_PIPE_RULE.search(lower):
+        return "连接管气管"
+    if _SPEC_EN_LIQUID_PIPE_RULE.search(lower):
+        return "连接管液管"
+    if _SPEC_EN_APF_RULE.search(lower):
+        return "APF"
+    if _SPEC_EN_COP_RULE.search(lower):
+        return "COP"
+    if _SPEC_EN_EER_RULE.search(lower):
+        return "EER"
+
+    for pattern, canonical in _SPEC_EN_NAME_RULES:
+        if pattern.search(lower):
+            return canonical
+
+    inferred = _infer_cn_spec_name_from_raw(raw)
+    if inferred:
+        return inferred
+    return clean
+
+
+def _normalize_performance_specs(specs: Sequence[Dict]) -> List[Dict]:
+    normalized: List[Dict] = []
+    seen = set()
+    for spec in specs or []:
+        if not isinstance(spec, dict):
+            continue
+        name = _canonicalize_spec_name(spec.get("name", ""), spec.get("raw", ""))
+        value = str(spec.get("value") or "").strip()
+        unit = str(spec.get("unit") or "").strip()
+        raw = str(spec.get("raw") or "").strip()
+        if not (name or value or unit or raw):
+            continue
+        item = {
+            "name": name,
+            "value": value,
+            "unit": unit,
+            "raw": raw,
+        }
+        key = (name, value, unit, raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return normalized
+
+
 def _normalize_spec_key(name: str) -> str:
-    return re.sub(r"[\s：:|/\\-]+", "", (name or "")).lower()
+    lowered = str(name or "").strip().lower()
+    lowered = (
+        lowered.replace("（", "(")
+        .replace("）", ")")
+        .replace("：", ":")
+        .replace("，", ",")
+        .replace("；", ";")
+    )
+    return re.sub(r"[\s,;:|/\\\-_()]+", "", lowered)
 
 
 def _pick_best_spec_entry(entries: List[Dict]) -> Dict:
@@ -2824,7 +3721,7 @@ def _deduplicate_products_by_model(products: List[Dict], config: Optional[Dict] 
                     continue
                 if spec_key not in merged_specs:
                     merged_specs[spec_key] = spec
-            base["performance_specs"] = list(merged_specs.values())
+            base["performance_specs"] = _normalize_performance_specs(list(merged_specs.values()))
         base = _enforce_single_value_specs(base, config or {})
         merged_products.append(base)
     return merged_products
@@ -2844,12 +3741,12 @@ def extract_relations_multistage(
     """
     cfg = dict(RELATION_EXTRACTOR_CONFIG)
     cfg["max_concurrent"] = max_concurrent
+    cfg["global_concurrency"] = max_concurrent
     cfg.setdefault("max_chars_per_call", 8000)
 
     logger = logging.getLogger("relation_extract_batch_v2")
     logger.setLevel(logging.INFO)
 
-    use_sliding_window = use_sliding_window and not cfg.get("v2_disable_loader_sliding_window", True)
     effective_window = window_size if use_sliding_window else 0
     pages = list(
         load_pages_with_context_v2(
@@ -2896,8 +3793,7 @@ def extract_relations_multistage(
                 )
 
         if not brands:
-            extractor.logger.warning("No brands found; fallback to whole-document extraction.")
-            brands = [{"name": "", "evidence": [], "pages": []}]
+            return []
 
         # Stage B: series
         if series_file.exists() and not force_rerun:
@@ -2976,12 +3872,6 @@ def extract_relations_multistage(
             encoding="utf-8",
         )
 
-        if not products:
-            extractor.logger.warning("No products extracted; emitting doc-level fallback.")
-            fallback = extractor._ensure_product_defaults(_default_product_template(), "", "", [])
-            fallback["product_model"] = "UNKNOWN_MODEL"
-            products = [fallback]
-
         return products
 
     raw_products = asyncio.run(_run())
@@ -2990,11 +3880,6 @@ def extract_relations_multistage(
     deduped = deduplicate_results([{"results": raw_products}])
     corrected = correct_all_categories(deduped)
     filtered = filter_empty_products(corrected)
-
-    if not filtered:
-        fallback = _default_product_template()
-        fallback["product_model"] = "UNKNOWN_MODEL"
-        filtered = [fallback]
 
     final_payload = [{"results": filtered}]
     output_path.parent.mkdir(parents=True, exist_ok=True)

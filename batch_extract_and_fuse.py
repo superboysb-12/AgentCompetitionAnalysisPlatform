@@ -10,9 +10,7 @@ from pathlib import Path
 os.environ.setdefault("LANGCHAIN_VERBOSE", "false")
 
 ROOT_DIR = Path(__file__).resolve().parent
-KNOWLEDGE_FUSION_DIR = ROOT_DIR / "KnowledgeFusion"
 sys.path.insert(0, str(ROOT_DIR))
-sys.path.insert(0, str(KNOWLEDGE_FUSION_DIR))
 
 from backend.settings import RELATION_EXTRACTOR_CONFIG  # noqa: E402
 from LLMRelationExtracter import (  # noqa: E402
@@ -28,18 +26,10 @@ from LLMRelationExtracter.relation_extractor import (  # noqa: E402
 )
 from LLMRelationExtracter_v2 import (  # noqa: E402
     extract_relations_multistage,
-    load_pages_with_context_v2,
 )
 from langchain_core.prompts import ChatPromptTemplate  # noqa: E402
 from langchain_openai import ChatOpenAI  # noqa: E402
 from tqdm import tqdm  # noqa: E402
-
-from alias_fusion import perform_alias_fusion  # noqa: E402
-from brand_inference import perform_brand_inference  # noqa: E402
-from config import load_all_configs  # noqa: E402
-from data_loader import load_and_prepare_data  # noqa: E402
-from data_saver import save_combined_log, save_entities_original_format  # noqa: E402
-from logger import get_logger, log_section  # noqa: E402
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -337,61 +327,6 @@ def extract_relations_for_csv_v2(
     )
 
 
-def run_knowledge_fusion(
-    relation_results_path: Path,
-    output_dir: Path,
-    max_concurrent: int,
-) -> Path:
-    logger = get_logger(log_dir=output_dir)
-    log_section(logger, f"KnowledgeFusion start: {relation_results_path.name}")
-
-    configs = load_all_configs()
-    llm_config = configs["llm"]
-    inference_config = configs["brand_inference"]
-    inference_config["max_concurrent"] = max_concurrent
-    data_config = configs["data"].copy()
-
-    data_config["input_path"] = str(relation_results_path)
-    data_config["output_dir"] = str(output_dir)
-
-    entities, original_data = load_and_prepare_data(data_config["input_path"], logger)
-
-    all_logs = {}
-
-    start_time = time.time()
-    entities, alias_map, alias_llm_results = perform_alias_fusion(
-        entities,
-        llm_config,
-        logger,
-    )
-    logger.info("Alias fusion completed in %.2fs", time.time() - start_time)
-    if alias_map or alias_llm_results:
-        all_logs["alias_fusion"] = {
-            "alias_map": alias_map,
-            "llm_results": alias_llm_results,
-        }
-
-    start_time = time.time()
-    entities, inference_results = perform_brand_inference(
-        entities,
-        llm_config,
-        inference_config,
-        logger,
-    )
-    logger.info("Brand inference completed in %.2fs", time.time() - start_time)
-    if inference_results:
-        all_logs["brand_inference"] = inference_results
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    original_path = output_dir / "fused_entities_original_format.json"
-    save_entities_original_format(entities, original_data, str(original_path), logger)
-
-    log_path = output_dir / "fusion_logs.json"
-    save_combined_log(all_logs, str(log_path), logger)
-
-    return original_path
-
-
 def append_error(error_log_path: Path, stage: str, message: str) -> None:
     error_log_path.parent.mkdir(parents=True, exist_ok=True)
     with error_log_path.open("a", encoding="utf-8") as error_writer:
@@ -409,7 +344,7 @@ def append_error(error_log_path: Path, stage: str, message: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Batch run relation extraction and knowledge fusion."
+        description="Batch run relation extraction."
     )
     parser.add_argument(
         "--input-dir",
@@ -458,8 +393,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--combined-output",
-        default="fused_entities_all.json",
-        help="Combined fusion output filename.",
+        default="relation_entities_all.json",
+        help="Combined relation output filename.",
     )
     args = parser.parse_args()
 
@@ -471,17 +406,14 @@ def main() -> None:
         return
 
     RELATION_EXTRACTOR_CONFIG["max_concurrent"] = args.max_concurrent
+    RELATION_EXTRACTOR_CONFIG["global_concurrency"] = args.max_concurrent
 
-    combined_batches = []
+    combined_products = []
 
     for csv_path in csv_paths:
-        stem = csv_path.stem
-        relation_output = output_dir / f"{stem}_relation_results.json"
-        error_log = output_dir / f"{stem}_errors.log"
-        fusion_output_dir = output_dir / f"{stem}_fusion"
-        fused_output = fusion_output_dir / "fused_entities_original_format.json"
+        relation_output = output_dir / f"{csv_path.stem}_relation_results.json"
+        error_log = output_dir / f"{csv_path.stem}_errors.log"
         relation_exists = relation_output.exists()
-        fusion_exists = fused_output.exists()
         relation_runner = (
             extract_relations_for_csv_v2
             if args.relation_version == "v2"
@@ -490,52 +422,39 @@ def main() -> None:
 
         print(f"Processing {csv_path}...")
 
-        if relation_exists and fusion_exists:
-            print(f"Skip {csv_path} (relation+fusion exist)")
+        if relation_exists:
+            print(f"Skip relation extraction for {csv_path} (exists)")
         else:
-            if relation_exists:
-                print(f"Skip relation extraction for {csv_path} (exists)")
-            else:
-                try:
-                    relation_runner(
-                        csv_path,
-                        relation_output,
-                        error_log,
-                        args.max_concurrent,
-                        use_sliding_window=args.use_sliding_window,
-                        window_size=args.window_size,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    append_error(error_log, "relation_extract", str(exc))
-                    print(f"Relation extraction failed for {csv_path}: {exc}")
-                    continue
-
-            if not fusion_exists:
-                try:
-                    fused_path = run_knowledge_fusion(
-                        relation_output,
-                        fusion_output_dir,
-                        args.max_concurrent,
-                    )
-                    fused_output = fused_path
-                except Exception as exc:  # noqa: BLE001
-                    append_error(error_log, "knowledge_fusion", str(exc))
-                    print(f"Knowledge fusion failed for {csv_path}: {exc}")
-                    continue
+            try:
+                relation_runner(
+                    csv_path,
+                    relation_output,
+                    error_log,
+                    args.max_concurrent,
+                    use_sliding_window=args.use_sliding_window,
+                    window_size=args.window_size,
+                )
+            except Exception as exc:  # noqa: BLE001
+                append_error(error_log, "relation_extract", str(exc))
+                print(f"Relation extraction failed for {csv_path}: {exc}")
+                continue
 
         try:
-            fused_data = json.loads(fused_output.read_text(encoding="utf-8"))
-            if isinstance(fused_data, list):
-                combined_batches.extend(fused_data)
+            relation_data = json.loads(relation_output.read_text(encoding="utf-8"))
+            if isinstance(relation_data, list):
+                for batch in relation_data:
+                    if isinstance(batch, dict):
+                        combined_products.extend(batch.get("results", []) or [])
         except Exception as exc:  # noqa: BLE001
             append_error(error_log, "combined_output", str(exc))
-            print(f"Failed to append fused data for {csv_path}: {exc}")
+            print(f"Failed to append relation data for {csv_path}: {exc}")
 
     combined_path = output_dir / args.combined_output
+    combined_payload = [{"results": combined_products}]
     combined_path.write_text(
-        json.dumps(combined_batches, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(combined_payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"Combined fusion output saved to {combined_path}")
+    print(f"Combined relation output saved to {combined_path}")
 
 
 if __name__ == "__main__":

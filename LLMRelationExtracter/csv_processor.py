@@ -15,6 +15,78 @@ _PAGE_SUFFIX_RE = re.compile(r"^(?P<prefix>.*)_page_(?P<index>\d+)$")
 _PART_PREFIX_RE = re.compile(r"^part_(?P<start>\d+)_(?P<end>\d+)_(?P<rest>.+)$")
 
 
+def _normalize_match_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def _looks_like_numeric_range_title(text: str) -> bool:
+    """
+    Detect OCR title noise like:
+      "2.2/2.5/2.8/3.2" or "14/22.4/28/33.5"
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    compact = re.sub(r"\s+", "", raw).lower()
+    compact = (
+        compact.replace("kw", "")
+        .replace("hp", "")
+        .replace("匹", "")
+        .replace("φ", "")
+        .replace("Φ", "")
+    )
+    if re.search(r"[a-z一-龥]", compact):
+        return False
+    if not re.fullmatch(r"[0-9./~+\-x×*()]+", compact):
+        return False
+    nums = re.findall(r"\d+(?:\.\d+)?", compact)
+    if len(nums) < 2:
+        return False
+    return any(sep in compact for sep in ("/", "~", "-", "×", "x"))
+
+
+def _parse_bbox_safe(raw_bbox) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        bbox = raw_bbox if isinstance(raw_bbox, (list, tuple)) else ast.literal_eval(str(raw_bbox or "[]"))
+    except Exception:
+        return None
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    try:
+        x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    except Exception:
+        return None
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _row_inside_table_bbox(
+    row_bbox: Optional[Tuple[float, float, float, float]],
+    table_bboxes: List[Tuple[float, float, float, float]],
+    min_cover_ratio: float = 0.85,
+) -> bool:
+    if not row_bbox or not table_bboxes:
+        return False
+    rx1, ry1, rx2, ry2 = row_bbox
+    row_area = max((rx2 - rx1) * (ry2 - ry1), 1e-6)
+    for tx1, ty1, tx2, ty2 in table_bboxes:
+        ix1 = max(rx1, tx1)
+        iy1 = max(ry1, ty1)
+        ix2 = min(rx2, tx2)
+        iy2 = min(ry2, ty2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        overlap = (ix2 - ix1) * (iy2 - iy1)
+        if overlap / row_area >= min_cover_ratio:
+            return True
+    return False
+
+
 def _parse_page_identifier(page: str) -> Tuple[str, int, str]:
     """
     Parse page label into (doc_group, page_order, raw_page).
@@ -186,6 +258,7 @@ def _format_page_content(rows: List[Dict]) -> str:
         prefix_map = {
             "title": "[title]",
             "text": "[text]",
+            "list": "[text]",
             "table": "[table]",
         }
         prefix = prefix_map.get(row_type, "[block]")

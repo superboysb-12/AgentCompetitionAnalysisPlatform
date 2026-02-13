@@ -40,6 +40,27 @@ class TableHTMLParser(HTMLParser):
         return self.current_table
 
 
+def looks_like_numeric_range_title(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    compact = re.sub(r"\s+", "", raw).lower()
+    compact = (
+        compact.replace("kw", "")
+        .replace("hp", "")
+        .replace("匹", "")
+        .replace("℃", "")
+    )
+    if re.search(r"[a-z一-龥]", compact):
+        return False
+    if not re.fullmatch(r"[0-9./~+\-x×*()]+", compact):
+        return False
+    nums = re.findall(r"\d+(?:\.\d+)?", compact)
+    if len(nums) < 2:
+        return False
+    return any(sep in compact for sep in ("/", "~", "-", "x", "×"))
+
+
 def extract_text_from_html(html_content: str) -> str:
     text = re.sub(r"<[^>]+>", "", html_content)
     text = unescape(text)
@@ -51,6 +72,15 @@ def parse_table_from_html(html_content: str) -> List[List[str]]:
     parser = TableHTMLParser()
     parser.feed(html_content)
     return parser.get_table()
+
+
+def normalize_table_rows(table_data: List[List[str]]) -> List[List[str]]:
+    normalized: List[List[str]] = []
+    for row in table_data or []:
+        cells = [re.sub(r"\s+", " ", str(cell or "")).strip() for cell in row]
+        if any(cells):
+            normalized.append(cells)
+    return normalized
 
 
 def extract_text_from_lines(lines: Iterable[dict]) -> str:
@@ -120,23 +150,29 @@ def process_json_file(path: Path) -> List[dict]:
             }
 
             if block_type == "table":
+                table_text_fallback = ""
                 for inner_block in block.get("blocks", []):
                     for line in inner_block.get("lines", []):
                         for span in line.get("spans", []):
                             if span.get("type") == "table":
                                 html = span.get("html", "")
                                 if html:
-                                    row["content"] = extract_text_from_html(html)
-                                    table_data = parse_table_from_html(html)
+                                    table_data = normalize_table_rows(parse_table_from_html(html))
                                     if table_data:
-                                        row["table_data"] = "\n".join(
-                                            [" | ".join(r) for r in table_data]
-                                        )
+                                        row["table_data"] = "\n".join([" | ".join(r) for r in table_data])
+                                        # Avoid duplicating full table as flattened content.
+                                        row["content"] = ""
+                                    else:
+                                        table_text_fallback = extract_text_from_html(html)
                                 if not row["image_path"]:
                                     row["image_path"] = span.get("image_path", "")
+                if not row["table_data"] and table_text_fallback:
+                    row["content"] = table_text_fallback
 
             elif block_type in {"text", "title", "list"}:
                 row["content"] = extract_text_from_lines(block.get("lines", []))
+                if block_type == "title" and looks_like_numeric_range_title(row["content"]):
+                    continue
 
             elif block_type == "image":
                 for inner_block in block.get("blocks", []):

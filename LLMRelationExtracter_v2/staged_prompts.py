@@ -90,11 +90,18 @@ MODEL_REVIEW_SCHEMA: Dict = {
                     "name": {"type": "string"},
                     "keep": {"type": "boolean"},
                     "kind": {"type": "string", "enum": ["model", "series", "other"]},
-                    "series_guess": {"type": "string"},
-                    "redirect_to": {"type": "string"},
-                    "confidence": {"type": "number"},
+                    "series_guess": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "redirect_to": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "confidence": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 },
-                "required": ["name", "keep", "kind"],
+                "required": [
+                    "name",
+                    "keep",
+                    "kind",
+                    "series_guess",
+                    "redirect_to",
+                    "confidence",
+                ],
             },
         }
     },
@@ -128,6 +135,25 @@ SERIES_REVIEW_SCHEMA: Dict = {
                     "canonical": {"type": "string"},
                 },
                 "required": ["original", "keep", "kind", "canonical"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+SERIES_CANON_SCHEMA: Dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "group_key": {"type": "string"},
+                    "canonical": {"type": "string"},
+                },
+                "required": ["group_key", "canonical"],
             },
         }
     },
@@ -172,8 +198,12 @@ PRODUCT_REVIEW_SCHEMA: Dict = {
                     "keep": {"type": "boolean"},
                     "is_accessory": {"type": "boolean"},
                     "series_feature": {"type": "boolean"},
+                    "role": {
+                        "type": "string",
+                        "enum": ["product", "series_feature", "accessory"],
+                    },
                 },
-                "required": ["product_model", "keep", "is_accessory"],
+                "required": ["product_model", "keep", "is_accessory", "series_feature", "role"],
             },
         }
     },
@@ -200,7 +230,7 @@ def build_brand_messages(text: str, page_label: str) -> List[Dict]:
             "content": (
                 f"Page: {page_label}\n"
                 "Extract brand names and evidence spans (short text snippets). "
-                "Skip series/model-only mentions (e.g., GMV ES belongs to brand Gree/格力, but GMV ES itself is not a brand). "
+                "Skip any series/model-only mentions; only keep actual brand/manufacturer names. "
                 "If a logo/brand is only implied, skip it.\n\n"
                 f"{text}"
             ),
@@ -235,7 +265,12 @@ def build_series_messages(
                 "Strict hierarchy separation is mandatory: "
                 "brand != series != model != product_type != feature. "
                 "Only output true series/line/sub-brand names under the given brand. "
+                "If one sentence/table row contains multiple series names, split them into separate series items. "
+                "Do not concatenate multiple series into one name. "
+                "Only keep HVAC product series. Do not output communication/network/protocol labels "
+                "or generic control/system terms or version notes. "
                 "Do not output brand names, model/SKU strings, product type/category words, or feature slogans. "
+                "Use strict rule-based judgment from the text itself; do not follow example patterns. "
                 "Return JSON with the exact brand echo and series names plus evidence."
             ),
         },
@@ -265,7 +300,7 @@ def build_series_filter_messages(brand: str, candidates: List[Dict]) -> List[Dic
             "role": "system",
             "content": (
                 "You are filtering series names for an HVAC brand. "
-                "Keep only series/line/sub-brand names (e.g., GMV9, CoolAny, Free Match, Ultra Heat). "
+                "Keep only series/line/sub-brand names. "
                 "Drop model numbers (contain full numeric/tonnage like 36K/280WM/S), single SKUs, parameter rows, or generic words. "
                 "Do not invent names. Output keep/drop lists."
             ),
@@ -288,12 +323,52 @@ def build_series_review_messages(brand: str, candidates: List[Dict]) -> List[Dic
         {
             "role": "system",
             "content": (
-                "You are reviewing Stage-B series candidates for an HVAC brand. Label each candidate with kind ∈ {series, product_type, feature, model_bucket, other}. - series: true product line/sub-brand (e.g., SDC+, Free Match, GMV9). - product_type: installation/category words (e.g., 风管式室内机, 吊顶机, 风机盘管, 新风机组). - feature: technology/功能/卖点 slogans. - model_bucket: loose model range or pattern only. - other: anything else. Keep=true only when kind=series. For series, output a concise canonical name (drop long descriptors/capacity). Do not invent names; rely only on provided evidence."
+                "You are reviewing Stage-B series candidates for an HVAC brand. "
+                "Label each candidate with kind ∈ {series, product_type, feature, model_bucket, other}. "
+                "- series: true product line/sub-brand. "
+                "- product_type: installation/category words. "
+                "- feature: technology/功能/卖点 slogans. "
+                "- model_bucket: loose model range or pattern only. "
+                "- other: anything else. "
+                "Keep=true only when kind=series. "
+                "For canonical: choose one stable canonical per same series alias group. "
+                "Prefer concise, product-like canonical names (e.g., coded series labels) over narrative/marketing sentences. "
+                "Drop non-product phrases such as protocol/network/control items (CAN/BACnet/Modbus), "
+                "version notes (上一代/下一代), and explanatory descriptors. "
+                "Use strict rule-based judgment; do not rely on example imitation. "
+                "Do not invent names; rely only on provided evidence."
             ),
         },
         {
             "role": "user",
             "content": f"Brand: {brand}\nCandidates:\n" + "\n".join(lines),
+        },
+    ]
+
+
+def build_series_canon_messages(brand: str, groups: List[Dict]) -> List[Dict]:
+    lines = []
+    for idx, item in enumerate(groups, 1):
+        aliases = " | ".join(item.get("aliases", [])[:8])
+        evid = "; ".join(item.get("evidence", [])[:2])
+        lines.append(
+            f"{idx}. group_key={item.get('group_key','')} | aliases={aliases} | evidence={evid}"
+        )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are canonicalizing HVAC Stage-B series alias groups. "
+                "For each group_key, choose exactly one canonical series name from the provided aliases only. "
+                "Do not invent names. "
+                "Prefer stable product-series labels, not explanatory/narrative sentences. "
+                "Avoid long clause-like aliases with punctuation or ellipsis. "
+                "Prefer concise canonical forms such as coded series names or coded series + product form."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Brand: {brand}\nGroups:\n" + "\n".join(lines),
         },
     ]
 
@@ -304,7 +379,7 @@ def build_model_messages(brand: str, series: str, text_block: str) -> List[Dict]
             "role": "system",
             "content": (
                 "You are extracting HVAC product model names under a given brand/series. "
-                "Output model identifiers (e.g., GMV-ND18PS/C, KFR-35GW/...) only. "
+                "Output concrete model identifiers only. "
                 "Do not output series names, technologies, categories, or generic words. "
                 "Preserve exact model spelling from the text."
             ),
@@ -332,7 +407,7 @@ def build_product_messages(
     model_hint = ""
     if known_models:
         model_hint = (
-            "Known models for this pair (focus extraction on these and their nearby table rows):\n"
+            "该品牌-系列下的已知型号（优先抽取这些型号及其邻近表格行）：\n"
             + ", ".join(known_models[:50])
             + "\n"
         )
@@ -340,56 +415,56 @@ def build_product_messages(
     target_hint = ""
     target_rules = ""
     identity_rules = (
-        "- Brand and series are already confirmed by upstream stages. Copy them exactly from input; do NOT rewrite.\n"
+        "- brand 与 series 已由上游阶段确认，必须按输入原样继承，禁止改写或重识别。\n"
     )
     model_pairing_rule = (
-        "- If indoor+outdoor are paired, include both models in fact_text/evidence; use outdoor as product_model when unclear.\n"
+        "- 若存在内外机配对，请在 fact_text/evidence 保留配对信息；无法判断时优先使用室外机型号作为 product_model。\n"
     )
     if target_model:
-        target_hint = f"Target model: {target_model}\n"
+        target_hint = f"目标型号: {target_model}\n"
         target_rules = (
-            f"- You MUST extract only information for target model '{target_model}'.\n"
-            "- Ignore rows/chunks about other models.\n"
-            "- If target model evidence is absent in this chunk, return an empty results array.\n"
+            f"- 仅允许抽取目标型号 '{target_model}' 的信息。\n"
+            "- 其他型号的行/段落一律忽略。\n"
+            "- 若当前文本块没有目标型号证据，返回空 results 数组。\n"
         )
         identity_rules += (
-            f"- product_model is fixed to target_model '{target_model}'. Do NOT infer, switch, or rewrite product_model.\n"
+            f"- product_model 固定为 target_model '{target_model}'，禁止推断、替换或改写。\n"
         )
         model_pairing_rule = (
-            "- If indoor+outdoor are paired, keep both models in fact_text/evidence, but product_model MUST remain target_model.\n"
+            "- 若存在内外机配对，可在 fact_text/evidence 保留配对信息，但 product_model 必须保持为 target_model。\n"
         )
     else:
         identity_rules += (
-            "- product_model must be grounded in the given known models when provided; do not invent new models.\n"
+            "- 提供了 known_models 时，product_model 必须来自 known_models，禁止虚构新型号。\n"
         )
 
     return [
         {
             "role": "system",
             "content": (
-                "You are a structured extractor focused on HVAC / air-conditioning products (VRF, chiller, AHU, FCU, packaged, split, heat pump, rooftop). "
-                "Return products under the given brand/series using the strict JSON schema. "
-                "Rules:\n"
-                "- One row/line/model -> one product. Do NOT merge different models.\n"
+                "你是暖通(HVAC)产品结构化抽取器。请按给定 JSON Schema 输出当前品牌/系列下的产品信息。\n"
+                "规则：\n"
+                "- 一行/一条/一个型号对应一个产品，禁止把不同型号合并。\n"
                 f"{target_rules}"
                 f"{identity_rules}"
-                "- Capture refrigerant (R32/R410A/R22/etc.), energy efficiency metrics (SEER/EER/COP/IPLV/IEER/APF/HSPF), cooling/heating capacity (kW, RT/ton, BTU/h), airflow, voltage/phase, indoor/outdoor unit model pairs.\n"
+                "- 尽量抽取：制冷剂、能效指标(SEER/EER/COP/IPLV/IEER/APF/HSPF)、制冷/制热量、风量、电源相数电压频率、内外机配对等。\n"
                 f"{model_pairing_rule}"
-                "- Preserve table row values; keep units; put any unmatched specs into performance_specs with raw text.\n"
-                "- rows_json blocks contain raw CSV rows with table_data/bbox; use them to bind specs to the correct model row.\n"
-                "- Only use information present in text; leave missing fields empty.\n"
-                "- Focus on attribute extraction (specs/features/evidence), not hierarchy identification."
+                "- 保留表格中的原始数值和单位；无法归类的技术参数也放入 performance_specs，并保留 raw 片段。\n"
+                "- 强制中文输出：performance_specs.name 必须是简洁中文参数名，不允许英文参数名。\n"
+                "- 若原文参数名是英文，先翻译为中文标准参数名再输出；APF/COP/EER/IPLV/SEER/HSPF 可保留缩写。\n"
+                "- rows_json 含原始 CSV 行与 table_data/bbox，可用于将参数绑定到正确型号行。\n"
+                "- 仅使用文本中可证实的信息；缺失字段留空。\n"
+                "- 重点是属性抽取（specs/features/evidence），不是层级识别。"
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Brand: {brand or '<unknown>'}\n"
-                f"Series: {series or '<unknown>'}\n"
+                f"品牌: {brand or '<unknown>'}\n"
+                f"系列: {series or '<unknown>'}\n"
                 f"{target_hint}"
                 f"{model_hint}"
-                "Extract product fields from this chunk. "
-                "Evidence should include short text fragments or table rows (you can quote rows_json entries).\n\n"
+                "请从以下文本块抽取产品字段。evidence 需给出短文本片段或表格行（可引用 rows_json）。\n\n"
                 f"{text_block}"
             ),
         },
@@ -443,7 +518,7 @@ def build_brand_global_filter_messages(candidates: List[Dict]) -> List[Dict]:
             "content": (
                 "You receive candidate names from HVAC documents. "
                 "Keep only true brands/manufacturers/trademarks. "
-                "Drop: series/line/model tokens (e.g., GMV, GMV ES, MDV, VRV, MRV, VRF, Ultra Heat, Free, X-COOLING), "
+                "Drop: series/line/model tokens and non-brand organization words, "
                 "institutes, departments, distributors, media, standards bodies. "
                 "If uncertain, prefer dropping to keep precision. "
                 "Return JSON with a 'keep' array of brand names to keep (can be empty)."
@@ -475,8 +550,8 @@ def build_brand_canon_messages(candidates: List[Dict]) -> List[Dict]:
                 "You are normalizing brand names for HVAC documents. "
                 "For each input brand, output a concise Chinese canonical brand name. "
                 "Rules:\n"
-                "- If the brand is already Chinese, keep or shorten to its common brand form (e.g., “格力电器” -> “格力”).\n"
-                "- If English brand has a well-known Chinese name, translate to that (e.g., Gree->格力, Midea->美的, Haier->海尔, Daikin->大金, Hitachi->日立, Panasonic->松下, Hisense->海信, Aux->奥克斯, TCL->TCL, Carrier->开利).\n"
+                "- If the brand is already Chinese, keep or shorten to its common brand form.\n"
+                "- If an English brand has a well-known Chinese canonical form, translate to that.\n"
                 "- If no reliable Chinese name is known, keep the original spelling.\n"
                 "- Do NOT create new brands beyond inputs; one output per input.\n"
                 "Return JSON with an 'items' array of {original, canonical_cn}."
@@ -510,7 +585,7 @@ def build_model_review_messages(
                 "For each name decide if it is a concrete product MODEL (keep=true) "
                 "vs series/line/other (keep=false). "
                 "Also guess the closest product series/line name if the text reveals it "
-                "(e.g., SDC系列, SDB, GMV-NDR). Leave empty if uncertain. "
+                "and leave it empty if uncertain. "
                 "If it clearly belongs to another series, set redirect_to and a confidence score 0-1. "
                 "Do not invent or rewrite names. Use evidence snippets only."
             ),
