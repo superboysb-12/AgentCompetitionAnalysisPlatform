@@ -6,7 +6,7 @@ Task strategy:
       part_<start>_<end>_<doc_id>.md
   - Keep id-only markdown names by default.
   - Clean low-information markdown files by text threshold.
-  - Run multiple document tasks concurrently.
+  - Run document tasks sequentially; global LLM RPM cap throttles outgoing calls.
 
 Outputs:
   results/<batch_name>/<brand>/<doc_key>/
@@ -26,8 +26,8 @@ import json
 import re
 import shutil
 import sys
+import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +45,7 @@ if sys.platform.startswith("win"):
         pass
 
 from LLMRelationExtracter_v2 import extract_relations_multistage  # noqa: E402
+from backend.settings import RELATION_EXTRACTOR_CONFIG  # noqa: E402
 
 _PART_STEM_RE = re.compile(
     r"^part_(?P<start>\d+)_(?P<end>\d+)_(?P<doc_id>.+?)(?:_result)?$",
@@ -53,6 +54,7 @@ _PART_STEM_RE = re.compile(
 _ID_ONLY_STEM_RE = re.compile(r"^[0-9a-z]{20,}$")
 _IMAGE_MD_RE = re.compile(r"!\[[^\]]*]\([^)]+\)")
 _MEANINGFUL_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
+_BATCH_ERROR_LOG_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -99,13 +101,6 @@ def _to_relative_display(path: Path) -> str:
         return str(path.resolve().relative_to(ROOT))
     except Exception:
         return str(path.resolve())
-
-
-def _normalize_doc_key(md_path: Path, brand_dir: Path) -> str:
-    relative_no_suffix = md_path.relative_to(brand_dir).with_suffix("")
-    raw_key = "__".join(relative_no_suffix.parts)
-    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", raw_key).strip("_")
-    return cleaned or md_path.stem
 
 
 def _sanitize_key(text: str) -> str:
@@ -293,11 +288,62 @@ def _discover_tasks(
     return tasks, stats, cleaned_samples
 
 
-def _append_error_log(error_log_path: Path, message: str) -> None:
-    error_log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with error_log_path.open("a", encoding="utf-8") as fp:
-        fp.write(f"\n[{timestamp}] {message}\n")
+def _append_batch_error_record(
+    batch_error_log: Path,
+    task: Task,
+    payload: Dict,
+) -> None:
+    batch_error_log.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "brand": task.brand,
+        "doc_key": task.doc_key,
+        "raw_doc_id": task.raw_doc_id,
+        "kind": task.kind,
+        "source_md_paths": [_to_relative_display(path) for path in task.md_files],
+        "payload": payload,
+    }
+    with _BATCH_ERROR_LOG_LOCK:
+        with batch_error_log.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _flush_task_error_log_to_batch(
+    task_error_log: Path,
+    batch_error_log: Path,
+    task: Task,
+) -> int:
+    if not task_error_log.exists():
+        return 0
+    flushed = 0
+    try:
+        with task_error_log.open("r", encoding="utf-8", errors="ignore") as fp:
+            for raw_line in fp:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                entry: Dict
+                try:
+                    parsed = json.loads(line)
+                    if isinstance(parsed, dict):
+                        entry = parsed
+                    else:
+                        entry = {"raw_line": line}
+                except Exception:
+                    entry = {"raw_line": line}
+                _append_batch_error_record(
+                    batch_error_log,
+                    task,
+                    {"source": "extractor", "entry": entry},
+                )
+                flushed += 1
+    except Exception as exc:  # noqa: BLE001
+        _append_batch_error_record(
+            batch_error_log,
+            task,
+            {"source": "batch_runner", "merge_error": str(exc)},
+        )
+    return flushed
 
 
 def _load_products_raw(stage_products_path: Path, relation_output_path: Path) -> List[Dict]:
@@ -378,18 +424,27 @@ def _run_one_task(
     task: Task,
     *,
     batch_root: Path,
+    batch_error_log: Path,
     skip_existing: bool,
     keep_task_inputs: bool,
     max_concurrent: int,
+    llm_global_rpm: int,
     window_size: int,
     use_sliding_window: bool,
-    show_progress: bool,
+    max_retries: int,
+    llm_call_hard_timeout: float,
 ) -> Dict:
     doc_output_dir = batch_root / task.brand / task.doc_key
     doc_output_dir.mkdir(parents=True, exist_ok=True)
+    legacy_doc_error_log = doc_output_dir / "errors.log"
+    if legacy_doc_error_log.exists():
+        legacy_doc_error_log.unlink()
 
     relation_output = doc_output_dir / "relation_results.json"
-    error_log = doc_output_dir / "errors.log"
+    task_error_log = batch_root / "_task_error_tmp" / task.brand / f"{task.doc_key}.jsonl"
+    task_error_log.parent.mkdir(parents=True, exist_ok=True)
+    if task_error_log.exists():
+        task_error_log.unlink()
     stage_dir = doc_output_dir / f"{task.doc_key}_v2_stage"
     stage_products = stage_dir / "products_raw.json"
 
@@ -402,7 +457,7 @@ def _run_one_task(
                 "task": task,
                 "products": products,
                 "relation_output": relation_output,
-                "error_log": error_log,
+                "error_log": batch_error_log,
                 "stage_products": stage_products,
                 "input_dir": None,
                 "error": None,
@@ -412,16 +467,20 @@ def _run_one_task(
         extract_relations_multistage(
             csv_path=task_input_dir,
             output_path=relation_output,
-            error_log_path=error_log,
+            error_log_path=task_error_log,
             max_concurrent=max_concurrent,
+            llm_global_concurrency=llm_global_rpm,
             window_size=window_size,
             use_sliding_window=use_sliding_window,
-            show_progress=show_progress,
+            show_progress=False,
+            max_retries=max_retries,
+            llm_call_hard_timeout=llm_call_hard_timeout,
         )
 
         products = _load_products_raw(stage_products, relation_output)
         brand_count = _load_stage_brand_count(stage_dir)
-        has_conn_error = _error_log_contains_connection_error(error_log)
+        has_conn_error = _error_log_contains_connection_error(task_error_log)
+        _flush_task_error_log_to_batch(task_error_log, batch_error_log, task)
 
         # Treat transient transport failures as failed tasks, not successful 0-product tasks.
         if has_conn_error and brand_count <= 0 and not products:
@@ -430,7 +489,7 @@ def _run_one_task(
                 "task": task,
                 "products": [],
                 "relation_output": relation_output,
-                "error_log": error_log,
+                "error_log": batch_error_log,
                 "stage_products": stage_products,
                 "input_dir": task_input_dir,
                 "error": "Connection error during extraction (no brands/products produced)",
@@ -441,25 +500,36 @@ def _run_one_task(
             "task": task,
             "products": products,
             "relation_output": relation_output,
-            "error_log": error_log,
+            "error_log": batch_error_log,
             "stage_products": stage_products,
             "input_dir": task_input_dir,
             "error": None,
         }
     except Exception as exc:
         error_text = "".join(traceback.format_exception(exc))
-        _append_error_log(error_log, error_text)
+        _append_batch_error_record(
+            batch_error_log,
+            task,
+            {
+                "source": "batch_runner",
+                "error": str(exc),
+                "traceback": error_text,
+            },
+        )
+        _flush_task_error_log_to_batch(task_error_log, batch_error_log, task)
         return {
             "status": "failed",
             "task": task,
             "products": [],
             "relation_output": relation_output,
-            "error_log": error_log,
+            "error_log": batch_error_log,
             "stage_products": stage_products,
             "input_dir": task_input_dir,
             "error": str(exc),
         }
     finally:
+        if task_error_log.exists():
+            task_error_log.unlink()
         if task_input_dir and task_input_dir.exists() and not keep_task_inputs:
             shutil.rmtree(task_input_dir, ignore_errors=True)
 
@@ -504,8 +574,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--doc-concurrency",
         type=int,
-        default=2,
-        help="How many document tasks run in parallel.",
+        default=0,
+        help="Deprecated and ignored. Document tasks run sequentially.",
+    )
+    parser.add_argument(
+        "--llm-global-concurrency",
+        type=int,
+        default=10,
+        help="Global LLM request cap in RPM (requests per minute) shared by all tasks.",
     )
     parser.add_argument(
         "--max-concurrent",
@@ -527,8 +603,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--show-progress",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show per-document stage progress bars (use --no-show-progress to disable).",
+        default=False,
+        help="Deprecated and ignored. Progress bars are disabled; call-level counters are printed.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Max retry count per LLM call. Default follows backend/settings.py.",
+    )
+    parser.add_argument(
+        "--llm-call-hard-timeout",
+        type=float,
+        default=None,
+        help="Hard timeout (seconds) for each single LLM call. Default follows backend/settings.py.",
     )
     parser.add_argument(
         "--skip-existing",
@@ -586,22 +674,47 @@ def main() -> None:
     if not tasks:
         raise FileNotFoundError(f"No markdown docs found under: {input_root}")
 
+    llm_global_rpm = max(1, int(args.llm_global_concurrency))
+    default_max_retries = max(0, int(RELATION_EXTRACTOR_CONFIG.get("max_retries", 8)))
+    default_llm_call_hard_timeout = float(RELATION_EXTRACTOR_CONFIG.get("llm_call_hard_timeout", 180.0))
+    effective_max_retries = (
+        max(0, int(args.max_retries))
+        if args.max_retries is not None
+        else default_max_retries
+    )
+    effective_llm_call_hard_timeout = (
+        max(1.0, float(args.llm_call_hard_timeout))
+        if args.llm_call_hard_timeout is not None
+        else default_llm_call_hard_timeout
+    )
+
     print(f"[batch-md] Input root: {_to_relative_display(input_root)}")
     print(f"[batch-md] Batch root: {_to_relative_display(batch_root)}")
     print(f"[batch-md] Tasks: {len(tasks)}")
     print(
         "[batch-md] Options: "
-        f"doc_concurrency={args.doc_concurrency}, max_concurrent={args.max_concurrent}, "
+        "scheduler=sequential, "
+        f"max_concurrent={args.max_concurrent}, "
+        f"llm_global_rpm={llm_global_rpm}, "
         f"window_size={args.window_size}, sliding_window={not args.no_sliding_window}, "
         f"skip_existing={args.skip_existing}, drop_id_only={args.drop_id_only}, "
-        f"min_text_chars={args.min_text_chars}, show_progress={args.show_progress}"
+        f"min_text_chars={args.min_text_chars}, "
+        f"max_retries={effective_max_retries}, "
+        f"llm_call_hard_timeout={effective_llm_call_hard_timeout}, "
+        f"progress_bar=disabled"
+    )
+    if bool(args.show_progress):
+        print("[batch-md] Note: --show-progress is deprecated and ignored.")
+    if int(args.doc_concurrency) != 0:
+        print("[batch-md] Note: --doc-concurrency is deprecated and ignored (sequential scheduler).")
+    print(
+        "[batch-md] Process-wide LLM RPM cap: "
+        f"{llm_global_rpm} req/min"
     )
     print(
-        "[batch-md] Approx max in-flight LLM calls: "
-        f"{max(1, int(args.doc_concurrency)) * max(1, int(args.max_concurrent))}"
+        f"[batch-md] LLM pacing: one request about every {60.0 / llm_global_rpm:.2f}s"
     )
-    if args.show_progress and max(1, int(args.doc_concurrency)) > 1:
-        print("[batch-md] Note: progress bars from concurrent docs may interleave.")
+    print("[batch-md] Console will print cumulative LLM call completions.")
     print(
         "[batch-md] Discovery: "
         f"md_files_total={discovery_stats['md_files_total']}, "
@@ -632,12 +745,13 @@ def main() -> None:
         return
 
     started_at = datetime.now()
-    safe_doc_concurrency = max(1, int(args.doc_concurrency))
     safe_max_concurrent = max(1, int(args.max_concurrent))
     flat_output = batch_root / "all_products_raw_flat.json"
     with_source_output = batch_root / "all_products_raw_with_source.json"
     summary_output = batch_root / "batch_summary.json"
     cleaned_output = batch_root / "cleaned_md_files.json"
+    batch_error_log = batch_root / "batch_errors.jsonl"
+    batch_error_log.write_text("", encoding="utf-8")
     cleaned_output.write_text(
         json.dumps(cleaned_samples, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -658,82 +772,76 @@ def main() -> None:
         brand_doc_count[task.brand] = brand_doc_count.get(task.brand, 0) + 1
 
     with JsonArrayWriter(flat_output) as flat_writer, JsonArrayWriter(with_source_output) as src_writer:
-        max_workers = safe_doc_concurrency
-        future_map = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for task in tasks:
-                future = pool.submit(
-                    _run_one_task,
-                    task,
-                    batch_root=batch_root,
-                    skip_existing=bool(args.skip_existing),
-                    keep_task_inputs=bool(args.keep_task_inputs),
-                    max_concurrent=safe_max_concurrent,
-                    window_size=int(args.window_size),
-                    use_sliding_window=not args.no_sliding_window,
-                    show_progress=bool(args.show_progress),
+        for completed, task in enumerate(tasks, start=1):
+            result = _run_one_task(
+                task,
+                batch_root=batch_root,
+                batch_error_log=batch_error_log,
+                skip_existing=bool(args.skip_existing),
+                keep_task_inputs=bool(args.keep_task_inputs),
+                max_concurrent=safe_max_concurrent,
+                llm_global_rpm=llm_global_rpm,
+                window_size=int(args.window_size),
+                use_sliding_window=not args.no_sliding_window,
+                max_retries=effective_max_retries,
+                llm_call_hard_timeout=effective_llm_call_hard_timeout,
+            )
+            status = result["status"]
+            products = result["products"] or []
+
+            if status == "failed":
+                docs_failed += 1
+                docs_executed += 1
+                brand_fail_count[task.brand] = brand_fail_count.get(task.brand, 0) + 1
+                fail_items.append(
+                    {
+                        "brand": task.brand,
+                        "doc_key": task.doc_key,
+                        "raw_doc_id": task.raw_doc_id,
+                        "kind": task.kind,
+                        "source_md_paths": [
+                            _to_relative_display(path) for path in task.md_files
+                        ],
+                        "error_log": _to_relative_display(result["error_log"]),
+                        "error": result["error"],
+                    }
                 )
-                future_map[future] = task
-
-            completed = 0
-            for future in as_completed(future_map):
-                completed += 1
-                result = future.result()
-                task = result["task"]
-                status = result["status"]
-                products = result["products"] or []
-
-                if status == "failed":
-                    docs_failed += 1
-                    docs_executed += 1
-                    brand_fail_count[task.brand] = brand_fail_count.get(task.brand, 0) + 1
-                    fail_items.append(
-                        {
-                            "brand": task.brand,
-                            "doc_key": task.doc_key,
-                            "raw_doc_id": task.raw_doc_id,
-                            "kind": task.kind,
-                            "source_md_paths": [
-                                _to_relative_display(path) for path in task.md_files
-                            ],
-                            "error_log": _to_relative_display(result["error_log"]),
-                            "error": result["error"],
-                        }
-                    )
-                    print(
-                        f"[batch-md] ({completed}/{len(tasks)}) "
-                        f"{task.brand}/{task.doc_key} failed: {result['error']}"
-                    )
-                    continue
-
-                if status == "skipped":
-                    docs_skipped += 1
-                    brand_skip_count[task.brand] = brand_skip_count.get(task.brand, 0) + 1
-                else:
-                    docs_executed += 1
-
-                docs_ok += 1
-                products_total += len(products)
-                brand_product_count[task.brand] = brand_product_count.get(task.brand, 0) + len(products)
-
-                source_md_paths = [_to_relative_display(path) for path in task.md_files]
-                for product in products:
-                    flat_writer.write(product)
-                    src_writer.write(
-                        {
-                            "source_brand": task.brand,
-                            "source_doc_key": task.doc_key,
-                            "source_doc_id": task.raw_doc_id,
-                            "source_kind": task.kind,
-                            "source_md_paths": source_md_paths,
-                            "product_raw": product,
-                        }
-                    )
-
                 print(
-                    f"[batch-md] ({completed}/{len(tasks)}) {task.brand}/{task.doc_key} "
-                    f"{status}: products_raw={len(products)}"
+                    f"[batch-md] ({completed}/{len(tasks)}) "
+                    f"{task.brand}/{task.doc_key} failed: {result['error']}"
                 )
+                continue
+
+            if status == "skipped":
+                docs_skipped += 1
+                brand_skip_count[task.brand] = brand_skip_count.get(task.brand, 0) + 1
+            else:
+                docs_executed += 1
+
+            docs_ok += 1
+            products_total += len(products)
+            brand_product_count[task.brand] = (
+                brand_product_count.get(task.brand, 0) + len(products)
+            )
+
+            source_md_paths = [_to_relative_display(path) for path in task.md_files]
+            for product in products:
+                flat_writer.write(product)
+                src_writer.write(
+                    {
+                        "source_brand": task.brand,
+                        "source_doc_key": task.doc_key,
+                        "source_doc_id": task.raw_doc_id,
+                        "source_kind": task.kind,
+                        "source_md_paths": source_md_paths,
+                        "product_raw": product,
+                    }
+                )
+
+            print(
+                f"[batch-md] ({completed}/{len(tasks)}) {task.brand}/{task.doc_key} "
+                f"{status}: products_raw={len(products)}"
+            )
 
     finished_at = datetime.now()
     summary = {
@@ -757,23 +865,20 @@ def main() -> None:
         "outputs": {
             "all_products_raw_flat": _to_relative_display(flat_output),
             "all_products_raw_with_source": _to_relative_display(with_source_output),
+            "batch_errors": _to_relative_display(batch_error_log),
             "cleaned_md_files": _to_relative_display(cleaned_output),
             "batch_summary": _to_relative_display(summary_output),
         },
         "runtime_config": {
-            "doc_concurrency": safe_doc_concurrency,
+            "scheduler_mode": "sequential",
+            "threadpool_workers": 0,
             "max_concurrent": safe_max_concurrent,
-            "max_inflight_llm_calls": safe_doc_concurrency * safe_max_concurrent,
-            "retry_until_success": os.getenv("RETRY_UNTIL_SUCCESS", "true").lower() == "true",
-            "max_retries": int(os.getenv("MAX_RETRIES", "8")),
-            "retry_delay": float(os.getenv("RETRY_DELAY", "2.0")),
-            "retry_backoff_factor": float(os.getenv("RETRY_BACKOFF_FACTOR", "2.5")),
-            "retry_max_delay": float(os.getenv("RETRY_MAX_DELAY", "120.0")),
-            "retry_jitter": float(os.getenv("RETRY_JITTER", "0.3")),
-            "retry_non_retryable_errors": os.getenv(
-                "RETRY_NON_RETRYABLE_ERRORS", "true"
-            ).lower()
-            == "true",
+            "llm_global_rpm": llm_global_rpm,
+            "max_retries": effective_max_retries,
+            "retry_delay": float(RELATION_EXTRACTOR_CONFIG.get("retry_delay", 2.0)),
+            "retry_backoff_factor": float(RELATION_EXTRACTOR_CONFIG.get("retry_backoff_factor", 2.5)),
+            "retry_max_delay": float(RELATION_EXTRACTOR_CONFIG.get("retry_max_delay", 120.0)),
+            "llm_call_hard_timeout": effective_llm_call_hard_timeout,
         },
         "failures": fail_items,
     }
@@ -787,6 +892,7 @@ def main() -> None:
     )
     print(f"[batch-md] all_products_raw_flat: {_to_relative_display(flat_output)}")
     print(f"[batch-md] all_products_raw_with_source: {_to_relative_display(with_source_output)}")
+    print(f"[batch-md] batch_errors: {_to_relative_display(batch_error_log)}")
     print(f"[batch-md] batch_summary: {_to_relative_display(summary_output)}")
 
 

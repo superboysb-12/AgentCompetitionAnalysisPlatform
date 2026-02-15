@@ -10,14 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
@@ -32,6 +30,12 @@ from LLMRelationExtracter import (  # v1 复用的通用模块
 from LLMRelationExtracter.md_processor import (
     load_pages_with_context_from_md,
     load_pages_with_context_from_md_directory,
+)
+from LLMRelationExtracter.llm_client import (
+    LangChainJsonLLMClient,
+    configure_global_llm_rpm,
+    extract_error_code,
+    get_global_llm_rpm,
 )
 from sklearn.cluster import AgglomerativeClustering
 from .staged_prompts import (
@@ -65,6 +69,7 @@ from .staged_prompts import (
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
 
 def load_pages_with_context_v2(
     source_path: str, window_size: int = 1, known_models: Optional[List[str]] = None
@@ -541,12 +546,14 @@ def _get_embedder(model_name: str, device: str):
 
 def _get_concurrency(config: Dict, key: str, default: int) -> int:
     """
-    Use one global concurrency for all LLM calls.
+    Read concurrency for stage-internal fan-out workers.
     """
-    if "global_concurrency" in config and config["global_concurrency"] is not None:
-        return int(config["global_concurrency"])
+    if key in config and config[key] is not None:
+        return max(1, int(config[key]))
     if "max_concurrent" in config and config["max_concurrent"] is not None:
-        return int(config["max_concurrent"])
+        return max(1, int(config["max_concurrent"]))
+    if "global_concurrency" in config and config["global_concurrency"] is not None:
+        return max(1, int(config["global_concurrency"]))
     return int(default)
 
 
@@ -895,10 +902,17 @@ def _default_product_template() -> Dict:
 
 def _append_error(error_log: Path, stage: str, meta: Dict, exc: Exception) -> None:
     error_log.parent.mkdir(parents=True, exist_ok=True)
+    error_code = extract_error_code(exc)
     with error_log.open("a", encoding="utf-8") as f:
         f.write(
             json.dumps(
-                {"stage": stage, "metadata": meta, "error": str(exc)},
+                {
+                    "stage": stage,
+                    "metadata": meta,
+                    "error": str(exc),
+                    "error_code": error_code,
+                    "error_type": exc.__class__.__name__,
+                },
                 ensure_ascii=False,
             )
             + "\n"
@@ -1233,6 +1247,7 @@ class StagedRelationExtractor:
         self.config = dict(RELATION_EXTRACTOR_CONFIG)
         if config:
             self.config.update(config)
+        self.logger = self._setup_logger(log_name)
 
         self.lc_llm = ChatOpenAI(
             api_key=self.config["api_key"],
@@ -1241,8 +1256,38 @@ class StagedRelationExtractor:
             temperature=0,
             timeout=self.config.get("timeout", 300),
         )
-        self.semaphore = asyncio.Semaphore(_get_concurrency(self.config, "max_concurrent", 5))
-        self.logger = self._setup_logger(log_name)
+        configured_rpm = int(
+            self.config.get(
+                "llm_global_rpm",
+                self.config.get("llm_global_concurrency", 10),
+            )
+        )
+        self.llm_global_rpm = configure_global_llm_rpm(configured_rpm)
+        self.llm_call_hard_timeout = float(self.config.get("llm_call_hard_timeout", 180.0))
+        effective_global_rpm = get_global_llm_rpm()
+        if effective_global_rpm is not None and effective_global_rpm != configured_rpm:
+            self.logger.info(
+                "Reuse existing global LLM RPM cap=%s (requested=%s)",
+                effective_global_rpm,
+                configured_rpm,
+            )
+        self.llm_client = LangChainJsonLLMClient(
+            self.lc_llm,
+            logger=self.logger,
+            max_retries=max(0, int(self.config.get("max_retries", 8))),
+            retry_delay=float(self.config.get("retry_delay", 2.0)),
+            retry_backoff_factor=float(self.config.get("retry_backoff_factor", 2.5)),
+            retry_max_delay=float(self.config.get("retry_max_delay", 120.0)),
+            hard_timeout=self.llm_call_hard_timeout,
+            rpm_limit=self.llm_global_rpm,
+            print_call_counter=True,
+            slow_call_threshold=30.0,
+            recycle_on_connection_error=bool(
+                self.config.get("llm_socket_recycle_on_connection_error", True)
+            ),
+            recycle_after_calls=int(self.config.get("llm_socket_recycle_after_calls", 0)),
+            recycle_min_interval=float(self.config.get("llm_socket_recycle_min_interval", 5.0)),
+        )
         self.brand_alias_map: Dict[str, List[str]] = {}
         self.brand_candidates_all: List[Dict] = []
         self.brand_dropped: List[Dict] = []
@@ -1331,176 +1376,8 @@ class StagedRelationExtractor:
         schema_name: str,
         metadata: Optional[Dict] = None,
     ) -> Dict:
-        return await self._acall_langchain(messages, schema, schema_name, metadata)
-
-    async def _acall_langchain(
-        self,
-        messages: List[Dict],
-        schema: Dict,
-        schema_name: str,
-        metadata: Optional[Dict] = None,
-    ) -> Dict:
         del metadata
-
-        lc_messages = []
-        for msg in messages or []:
-            role = str((msg or {}).get("role") or "").strip().lower()
-            content = str((msg or {}).get("content") or "")
-            if role == "system":
-                lc_messages.append(SystemMessage(content=content))
-            elif role == "assistant":
-                lc_messages.append(AIMessage(content=content))
-            else:
-                lc_messages.append(HumanMessage(content=content))
-
-        llm = self.lc_llm.bind(
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": schema_name, "schema": schema, "strict": True},
-            }
-        )
-        parse_attempt = 0
-        while True:
-            response = await self._ainvoke_with_retry(llm, lc_messages, schema_name)
-            try:
-                content = self._response_to_text(response)
-                if not content:
-                    raise ValueError(f"Empty response for {schema_name}")
-                return json.loads(content)
-            except Exception as exc:  # noqa: BLE001
-                should_retry = self._should_retry(parse_attempt, exc, treat_as_retryable=True)
-                if not should_retry:
-                    if isinstance(exc, ValueError):
-                        preview = content[:200] if "content" in locals() else ""
-                        raise ValueError(f"Invalid JSON for {schema_name}: {preview}") from exc
-                    raise
-                delay = self._compute_retry_delay(parse_attempt)
-                total = self._retry_total_display()
-                if parse_attempt < 5 or (parse_attempt + 1) % 10 == 0:
-                    self.logger.warning(
-                        "LLM response parse failed for %s, retry %s/%s in %.2fs: %s",
-                        schema_name,
-                        parse_attempt + 1,
-                        total,
-                        delay,
-                        exc,
-                    )
-                parse_attempt += 1
-                await asyncio.sleep(delay)
-
-    def _response_to_text(self, response) -> str:  # noqa: ANN001
-        raw_content = getattr(response, "content", "")
-        if isinstance(raw_content, str):
-            return raw_content.strip()
-        if isinstance(raw_content, list):
-            text_parts: List[str] = []
-            for part in raw_content:
-                if isinstance(part, dict):
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        text_parts.append(text)
-                elif isinstance(part, str):
-                    text_parts.append(part)
-            return "".join(text_parts).strip()
-        return str(raw_content or "").strip()
-
-    def _retry_until_success(self) -> bool:
-        return bool(self.config.get("retry_until_success", False))
-
-    def _retry_total_display(self) -> str:
-        if self._retry_until_success():
-            return "inf"
-        return str(max(0, int(self.config.get("max_retries", 8))))
-
-    def _compute_retry_delay(self, attempt: int) -> float:
-        base_delay = max(0.1, float(self.config.get("retry_delay", 2.0)))
-        backoff_factor = max(1.0, float(self.config.get("retry_backoff_factor", 2.5)))
-        max_delay = max(base_delay, float(self.config.get("retry_max_delay", 120.0)))
-        jitter = max(0.0, float(self.config.get("retry_jitter", 0.3)))
-        delay = min(max_delay, base_delay * (backoff_factor ** max(0, attempt)))
-        if jitter > 0:
-            delay = max(0.05, delay * (1 + random.uniform(-jitter, jitter)))
-        return delay
-
-    def _should_retry(self, attempt: int, exc: Exception, treat_as_retryable: bool = False) -> bool:
-        retry_until_success = self._retry_until_success()
-        max_retries = max(0, int(self.config.get("max_retries", 8)))
-        retry_non_retryable = bool(self.config.get("retry_non_retryable_errors", True))
-        is_retryable = treat_as_retryable or self._is_retryable_llm_error(exc)
-        if retry_until_success:
-            return is_retryable or retry_non_retryable
-        if attempt >= max_retries:
-            return False
-        return is_retryable or retry_non_retryable
-
-    def _is_retryable_llm_error(self, exc: Exception) -> bool:
-        status_code = getattr(exc, "status_code", None)
-        if status_code is None:
-            response = getattr(exc, "response", None)
-            status_code = getattr(response, "status_code", None)
-        if isinstance(status_code, int):
-            if status_code in {408, 409, 425, 429}:
-                return True
-            if status_code >= 500:
-                return True
-
-        exc_name = exc.__class__.__name__.lower()
-        text = str(exc or "").lower()
-        retryable_tokens = (
-            "connection error",
-            "connection reset",
-            "temporarily unavailable",
-            "timed out",
-            "timeout",
-            "rate limit",
-            "too many requests",
-            "service unavailable",
-            "gateway timeout",
-            "bad gateway",
-            "server disconnected",
-            "api connection",
-            "api timeout",
-            "stream closed",
-            "network",
-        )
-        retryable_names = (
-            "apiconnectionerror",
-            "apitimeouterror",
-            "ratelimiterror",
-            "internalservererror",
-            "serviceunavailableerror",
-            "connecterror",
-            "readtimeout",
-            "writetimeout",
-            "pooltimeout",
-            "transporterror",
-        )
-        return any(token in text for token in retryable_tokens) or any(
-            token in exc_name for token in retryable_names
-        )
-
-    async def _ainvoke_with_retry(self, llm, lc_messages: List, schema_name: str):  # noqa: ANN001
-        attempt = 0
-        while True:
-            try:
-                async with self.semaphore:
-                    return await llm.ainvoke(lc_messages)
-            except Exception as exc:  # noqa: BLE001
-                if not self._should_retry(attempt, exc):
-                    raise
-                delay = self._compute_retry_delay(attempt)
-                total = self._retry_total_display()
-                if attempt < 5 or (attempt + 1) % 10 == 0:
-                    self.logger.warning(
-                        "LLM call failed for %s, retry %s/%s in %.2fs: %s",
-                        schema_name,
-                        attempt + 1,
-                        total,
-                        delay,
-                        exc,
-                    )
-                attempt += 1
-                await asyncio.sleep(delay)
+        return await self.llm_client.call_json(messages, schema, schema_name)
 
     # -------------------------- Stage A: brand ----------------------------- #
     async def _extract_brands_single(
@@ -2536,10 +2413,20 @@ class StagedRelationExtractor:
         for brand_item in brands:
             brand_name = brand_item["name"]
             raw_series_list: List[Dict] = []
+            page_limit = _get_concurrency(self.config, "series_page_concurrency", 12)
+            page_sem = asyncio.Semaphore(page_limit)
+
             async def _run_page(text: str, meta: Dict) -> List[Dict]:
                 return await self._extract_series_single(brand_name, text, meta, error_log)
 
-            page_tasks = [asyncio.create_task(_run_page(text, meta)) for text, meta in pages]
+            async def _run_page_bounded(text: str, meta: Dict) -> List[Dict]:
+                async with page_sem:
+                    return await _run_page(text, meta)
+
+            page_tasks = [
+                asyncio.create_task(_run_page_bounded(text, meta))
+                for text, meta in pages
+            ]
             if page_tasks:
                 if show_progress:
                     results = []
@@ -2576,13 +2463,21 @@ class StagedRelationExtractor:
                     clusters = self._cluster_pages_for_brands(pages, cluster_size)
 
             if clusters:
+                cluster_limit = _get_concurrency(
+                    self.config,
+                    "series_cluster_concurrency",
+                    6,
+                )
+                cluster_sem = asyncio.Semaphore(cluster_limit)
+
                 async def _run_cluster(cluster_text: str, page_labels: List) -> List[Dict]:
-                    return await self._extract_series_cluster(
-                        brand_name,
-                        cluster_text,
-                        page_labels,
-                        error_log,
-                    )
+                    async with cluster_sem:
+                        return await self._extract_series_cluster(
+                            brand_name,
+                            cluster_text,
+                            page_labels,
+                            error_log,
+                        )
 
                 cluster_tasks = [
                     asyncio.create_task(_run_cluster(cluster_text, page_labels))
@@ -3534,8 +3429,10 @@ class StagedRelationExtractor:
     async def extract_document(
         self, pages: Sequence[Tuple[str, Dict]], error_log: Path, show_progress: bool = False
     ) -> List[Dict]:
-        # flag for inner methods
-        self._show_progress = show_progress
+        # Progress bars are globally disabled; keep argument for backward compatibility.
+        self._show_progress = False
+        if show_progress:
+            self.logger.info("show_progress is deprecated and ignored; progress bars are disabled.")
         brands = await self.run_brand_stage(pages, error_log)
         if not brands:
             return []
@@ -4637,9 +4534,12 @@ def extract_relations_multistage(
     output_path: Path,
     error_log_path: Path,
     max_concurrent: int = 100,
+    llm_global_concurrency: Optional[int] = None,
     window_size: int = 1,
     use_sliding_window: bool = True,
     show_progress: bool = False,
+    max_retries: Optional[int] = None,
+    llm_call_hard_timeout: Optional[float] = None,
 ) -> None:
     """
     Orchestrate multi-stage extraction end-to-end. Output shape matches v1.
@@ -4647,6 +4547,14 @@ def extract_relations_multistage(
     cfg = dict(RELATION_EXTRACTOR_CONFIG)
     cfg["max_concurrent"] = max_concurrent
     cfg["global_concurrency"] = max_concurrent
+    if llm_global_concurrency is not None:
+        rpm = max(1, int(llm_global_concurrency))
+        cfg["llm_global_concurrency"] = rpm
+        cfg["llm_global_rpm"] = rpm
+    if max_retries is not None:
+        cfg["max_retries"] = max(0, int(max_retries))
+    if llm_call_hard_timeout is not None:
+        cfg["llm_call_hard_timeout"] = max(1.0, float(llm_call_hard_timeout))
     cfg.setdefault("max_chars_per_call", 8000)
 
     logger = logging.getLogger("relation_extract_batch_v2")
@@ -4663,8 +4571,10 @@ def extract_relations_multistage(
         return
 
     extractor = StagedRelationExtractor(cfg)
-    # toggle tqdm progress bars inside stage methods
-    extractor._show_progress = show_progress
+    # Progress bars are globally disabled; keep argument for backward compatibility.
+    extractor._show_progress = False
+    if show_progress:
+        logger.info("show_progress is deprecated and ignored; progress bars are disabled.")
 
     # stage checkpoint directory per CSV
     stage_dir = output_path.parent / f"{csv_path.stem}_v2_stage"

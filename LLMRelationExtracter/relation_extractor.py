@@ -3,16 +3,15 @@ Relation extractor - extract structured product relations from plain text.
 """
 
 import asyncio
-import json
 import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from backend.settings import RELATION_EXTRACTOR_CONFIG
+from LLMRelationExtracter.llm_client import LangChainJsonLLMClient
 
 # JSON schema for strict response validation (simplified, aligns with target table)
 RELATION_SCHEMA = {
@@ -78,6 +77,7 @@ RELATION_SCHEMA = {
 
 class RelationExtractor:
     def __init__(self) -> None:
+        self.logger = self._setup_logging()
         self.llm = ChatOpenAI(
             api_key=RELATION_EXTRACTOR_CONFIG["api_key"],
             base_url=RELATION_EXTRACTOR_CONFIG["base_url"],
@@ -86,7 +86,42 @@ class RelationExtractor:
             timeout=RELATION_EXTRACTOR_CONFIG["timeout"],
         )
         self.semaphore = asyncio.Semaphore(RELATION_EXTRACTOR_CONFIG["max_concurrent"])
-        self.logger = self._setup_logging()
+        self.llm_client = LangChainJsonLLMClient(
+            self.llm,
+            logger=self.logger,
+            max_retries=int(RELATION_EXTRACTOR_CONFIG.get("max_retries", 8)),
+            retry_delay=float(RELATION_EXTRACTOR_CONFIG.get("retry_delay", 2.0)),
+            retry_backoff_factor=float(
+                RELATION_EXTRACTOR_CONFIG.get("retry_backoff_factor", 2.5)
+            ),
+            retry_max_delay=float(RELATION_EXTRACTOR_CONFIG.get("retry_max_delay", 120.0)),
+            hard_timeout=float(RELATION_EXTRACTOR_CONFIG.get("llm_call_hard_timeout", 180.0)),
+            rpm_limit=int(
+                RELATION_EXTRACTOR_CONFIG.get(
+                    "llm_global_rpm",
+                    RELATION_EXTRACTOR_CONFIG.get("llm_global_concurrency", 10),
+                )
+            ),
+            print_call_counter=False,
+            recycle_on_connection_error=bool(
+                RELATION_EXTRACTOR_CONFIG.get(
+                    "llm_socket_recycle_on_connection_error",
+                    True,
+                )
+            ),
+            recycle_after_calls=int(
+                RELATION_EXTRACTOR_CONFIG.get(
+                    "llm_socket_recycle_after_calls",
+                    0,
+                )
+            ),
+            recycle_min_interval=float(
+                RELATION_EXTRACTOR_CONFIG.get(
+                    "llm_socket_recycle_min_interval",
+                    5.0,
+                )
+            ),
+        )
         self.system_prompt = RELATION_EXTRACTOR_CONFIG.get("system_prompt", "")
         self.performance_units = RELATION_EXTRACTOR_CONFIG.get(
             "performance_param_units", {}
@@ -129,84 +164,48 @@ class RelationExtractor:
         Extract product relations from text and return a list of relation objects.
         """
         async with self.semaphore:
-            for attempt in range(RELATION_EXTRACTOR_CONFIG["max_retries"]):
-                try:
-                    llm = self.llm.bind(
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "relation_schema",
-                                "schema": RELATION_SCHEMA,
-                                "strict": True,
-                            },
-                        }
-                    )
-                    response = await llm.ainvoke(
-                        [
-                            SystemMessage(
-                                content=(
-                                    self.system_prompt
-                                    or "You are a product information extraction expert. Only extract fields with evidence; if absent leave empty strings or empty arrays."
-                                )
+            try:
+                payload = await self.llm_client.call_json(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                self.system_prompt
+                                or "You are a product information extraction expert. Only extract fields with evidence; if absent leave empty strings or empty arrays."
                             ),
-                            HumanMessage(
-                                content=(
-                                    "Extract product relations from the text below. "
-                                    "IMPORTANT INSTRUCTIONS:\n"
-                                    "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
-                                    "- Use context from other pages only to complete information for products on the current page\n"
-                                    "- If a table spans multiple pages, merge the information for products on the current page\n"
-                                    "- If multiple product models are present (e.g., table rows), output one result per model\n"
-                                    "- Do NOT merge specs across different models\n"
-                                    "- Do NOT extract products that only appear in context pages\n\n"
-                                    f"{text}"
-                                )
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Extract product relations from the text below. "
+                                "IMPORTANT INSTRUCTIONS:\n"
+                                "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
+                                "- Use context from other pages only to complete information for products on the current page\n"
+                                "- If a table spans multiple pages, merge the information for products on the current page\n"
+                                "- If multiple product models are present (e.g., table rows), output one result per model\n"
+                                "- Do NOT merge specs across different models\n"
+                                "- Do NOT extract products that only appear in context pages\n\n"
+                                f"{text}"
                             ),
-                        ]
-                    )
-
-                    raw_content = getattr(response, "content", "")
-                    if isinstance(raw_content, str):
-                        content = raw_content
-                    elif isinstance(raw_content, list):
-                        text_parts: List[str] = []
-                        for part in raw_content:
-                            if isinstance(part, dict):
-                                text = part.get("text")
-                                if isinstance(text, str):
-                                    text_parts.append(text)
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "".join(text_parts)
-                    else:
-                        content = str(raw_content or "")
-                    if not content:
-                        raise ValueError(f"Empty content from model: {response}")
-
-                    data = json.loads(content)
-                    results = data.get("results", [])
-                    processed = [self._post_process_item(item) for item in results]
-                    return processed
-
-                except Exception as exc:  # noqa: BLE001
-                    preview = (text or "")[:200]
-                    self.logger.error(
-                        "Extraction failed (attempt %s/%s): %s",
-                        attempt + 1,
-                        RELATION_EXTRACTOR_CONFIG["max_retries"],
-                        exc,
-                        exc_info=True,
-                    )
-                    self.logger.error("Input text preview: %s...", preview)
-                    if metadata:
-                        self.logger.error("Metadata: %s", metadata)
-
-                    if attempt == RELATION_EXTRACTOR_CONFIG["max_retries"] - 1:
-                        raise
-
-                    await asyncio.sleep(RELATION_EXTRACTOR_CONFIG["retry_delay"])
-
-        return []
+                        },
+                    ],
+                    RELATION_SCHEMA,
+                    "relation_schema",
+                )
+                results = payload.get("results", [])
+                processed = [self._post_process_item(item) for item in results]
+                return processed
+            except Exception as exc:  # noqa: BLE001
+                preview = (text or "")[:200]
+                self.logger.error(
+                    "Extraction failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+                self.logger.error("Input text preview: %s...", preview)
+                if metadata:
+                    self.logger.error("Metadata: %s", metadata)
+                raise
 
     def _post_process_item(self, item: Dict) -> Dict:
         """Normalize fields, enforce units, and ensure required keys exist."""

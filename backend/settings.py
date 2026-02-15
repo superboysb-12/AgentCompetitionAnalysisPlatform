@@ -149,20 +149,29 @@ RELATION_EXTRACTOR_CONFIG = {
     # Concurrency control
     "global_concurrency": int(os.getenv("GLOBAL_CONCURRENCY", os.getenv("MAX_CONCURRENT", "100"))),
     "max_concurrent": int(os.getenv("MAX_CONCURRENT", "100")),
-    "timeout": int(os.getenv("REQUEST_TIMEOUT", 3000)),  # 请求超时时间(秒),默认3分钟
+    # Backward-compatible name: llm_global_concurrency now means global RPM cap.
+    "llm_global_concurrency": int(os.getenv("LLM_GLOBAL_RPM", os.getenv("LLM_GLOBAL_CONCURRENCY", 10))),
+    "llm_global_rpm": int(os.getenv("LLM_GLOBAL_RPM", os.getenv("LLM_GLOBAL_CONCURRENCY", 10))),
+    "timeout": int(os.getenv("REQUEST_TIMEOUT", 3000)),  # ??????(?),??3??
+    # Hard timeout guard for each single llm.ainvoke call (seconds).
+    "llm_call_hard_timeout": float(os.getenv("LLM_CALL_HARD_TIMEOUT", 180.0)),
+    # Socket recycle strategy for unstable network / pooled connections.
+    "llm_socket_recycle_on_connection_error": os.getenv(
+        "LLM_SOCKET_RECYCLE_ON_CONNECTION_ERROR",
+        "true",
+    ).lower()
+    == "true",
+    "llm_socket_recycle_after_calls": int(os.getenv("LLM_SOCKET_RECYCLE_AFTER_CALLS", 0)),
+    "llm_socket_recycle_min_interval": float(
+        os.getenv("LLM_SOCKET_RECYCLE_MIN_INTERVAL", 5.0)
+    ),
 
-    # Retry config
-    # retry_until_success=true means keep retrying indefinitely until success.
-    "retry_until_success": os.getenv("RETRY_UNTIL_SUCCESS", "true").lower() == "true",
-    # Applied only when retry_until_success=false.
+    # Retry config (basic finite exponential backoff)
     "max_retries": int(os.getenv("MAX_RETRIES", 8)),
     # Exponential backoff: delay = retry_delay * (retry_backoff_factor ** attempt)
     "retry_delay": float(os.getenv("RETRY_DELAY", 2.0)),
     "retry_backoff_factor": float(os.getenv("RETRY_BACKOFF_FACTOR", 2.5)),
     "retry_max_delay": float(os.getenv("RETRY_MAX_DELAY", 120.0)),
-    "retry_jitter": float(os.getenv("RETRY_JITTER", 0.3)),
-    # When true, even non-retryable/classification-unknown errors continue retrying.
-    "retry_non_retryable_errors": os.getenv("RETRY_NON_RETRYABLE_ERRORS", "true").lower() == "true",
 
     # CSV handling
     "ignored_types": ["image", "discarded_header", "discarded_footer"],
@@ -194,6 +203,14 @@ RELATION_EXTRACTOR_CONFIG = {
     ),
     "brand_translate_threshold": float(os.getenv("BRAND_TRANSLATE_THRESHOLD", 0.25)),
     "brand_translate_device": os.getenv("BRAND_TRANSLATE_DEVICE", "cpu"),
+    # Stage-level fan-out concurrency
+    "series_page_concurrency": int(os.getenv("SERIES_PAGE_CONCURRENCY", 12)),
+    "series_cluster_concurrency": int(os.getenv("SERIES_CLUSTER_CONCURRENCY", 6)),
+    "model_pair_concurrency": int(os.getenv("MODEL_PAIR_CONCURRENCY", 6)),
+    "model_chunk_concurrency": int(os.getenv("MODEL_CHUNK_CONCURRENCY", 8)),
+    "product_pair_concurrency": int(os.getenv("PRODUCT_PAIR_CONCURRENCY", 6)),
+    "product_chunk_concurrency": int(os.getenv("PRODUCT_CHUNK_CONCURRENCY", 8)),
+    "product_model_concurrency": int(os.getenv("PRODUCT_MODEL_CONCURRENCY", 6)),
     "series_keyword_boost": [
         k
         for k in os.getenv(
