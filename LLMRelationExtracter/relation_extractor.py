@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from backend.settings import RELATION_EXTRACTOR_CONFIG
 from LLMRelationExtracter.llm_client import (
-    LangChainJsonLLMClient,
+    build_json_llm_client_from_config,
     get_shared_chat_openai,
 )
 
@@ -85,40 +85,25 @@ class RelationExtractor:
             model=RELATION_EXTRACTOR_CONFIG["model"],
             temperature=0,
             timeout=RELATION_EXTRACTOR_CONFIG["timeout"],
+            http_max_connections=RELATION_EXTRACTOR_CONFIG.get(
+                "llm_http_max_connections",
+                200,
+            ),
+            http_max_keepalive_connections=RELATION_EXTRACTOR_CONFIG.get(
+                "llm_http_max_keepalive_connections",
+                100,
+            ),
+            http_keepalive_expiry=RELATION_EXTRACTOR_CONFIG.get(
+                "llm_http_keepalive_expiry",
+                30.0,
+            ),
         )
         self.semaphore = asyncio.Semaphore(RELATION_EXTRACTOR_CONFIG["max_concurrent"])
-        self.llm_client = LangChainJsonLLMClient(
+        self.llm_client = build_json_llm_client_from_config(
             self.llm,
+            config=RELATION_EXTRACTOR_CONFIG,
             logger=self.logger,
-            max_retries=int(RELATION_EXTRACTOR_CONFIG.get("max_retries", 8)),
-            retry_delay=float(RELATION_EXTRACTOR_CONFIG.get("retry_delay", 2.0)),
-            retry_backoff_factor=float(
-                RELATION_EXTRACTOR_CONFIG.get("retry_backoff_factor", 2.5)
-            ),
-            retry_max_delay=float(RELATION_EXTRACTOR_CONFIG.get("retry_max_delay", 120.0)),
-            hard_timeout=float(RELATION_EXTRACTOR_CONFIG.get("llm_call_hard_timeout", 180.0)),
-            llm_global_concurrency=int(
-                RELATION_EXTRACTOR_CONFIG.get("llm_global_concurrency", 10)
-            ),
             print_call_counter=False,
-            recycle_on_connection_error=bool(
-                RELATION_EXTRACTOR_CONFIG.get(
-                    "llm_socket_recycle_on_connection_error",
-                    True,
-                )
-            ),
-            recycle_after_calls=int(
-                RELATION_EXTRACTOR_CONFIG.get(
-                    "llm_socket_recycle_after_calls",
-                    0,
-                )
-            ),
-            recycle_min_interval=float(
-                RELATION_EXTRACTOR_CONFIG.get(
-                    "llm_socket_recycle_min_interval",
-                    5.0,
-                )
-            ),
         )
         self.system_prompt = RELATION_EXTRACTOR_CONFIG.get("system_prompt", "")
         self.performance_units = RELATION_EXTRACTOR_CONFIG.get(

@@ -31,9 +31,10 @@ from LLMRelationExtracter.md_processor import (
     load_pages_with_context_from_md_directory,
 )
 from LLMRelationExtracter.llm_client import (
-    LangChainJsonLLMClient,
+    build_json_llm_client_from_config,
     configure_global_llm_concurrency,
     extract_error_code,
+    extract_error_diagnostics,
     get_global_llm_concurrency,
     get_shared_chat_openai,
     is_shared_chat_openai_instance,
@@ -905,6 +906,7 @@ def _default_product_template() -> Dict:
 def _append_error(error_log: Path, stage: str, meta: Dict, exc: Exception) -> None:
     error_log.parent.mkdir(parents=True, exist_ok=True)
     error_code = extract_error_code(exc)
+    diagnostics = extract_error_diagnostics(exc)
     with error_log.open("a", encoding="utf-8") as f:
         f.write(
             json.dumps(
@@ -914,6 +916,13 @@ def _append_error(error_log: Path, stage: str, meta: Dict, exc: Exception) -> No
                     "error": str(exc),
                     "error_code": error_code,
                     "error_type": exc.__class__.__name__,
+                    "root_error_type": diagnostics.get("root_error_type"),
+                    "root_error": diagnostics.get("root_error"),
+                    "request_method": diagnostics.get("request_method"),
+                    "request_host": diagnostics.get("request_host"),
+                    "request_url": diagnostics.get("request_url"),
+                    "response_status_code": diagnostics.get("response_status_code"),
+                    "error_chain": diagnostics.get("error_chain"),
                 },
                 ensure_ascii=False,
             )
@@ -1257,6 +1266,12 @@ class StagedRelationExtractor:
             model=self.config["model"],
             temperature=0,
             timeout=self.config.get("timeout", 300),
+            http_max_connections=self.config.get("llm_http_max_connections", 200),
+            http_max_keepalive_connections=self.config.get(
+                "llm_http_max_keepalive_connections",
+                100,
+            ),
+            http_keepalive_expiry=self.config.get("llm_http_keepalive_expiry", 30.0),
         )
         configured_llm_global_concurrency = int(
             self.config.get("llm_global_concurrency", 10)
@@ -1264,7 +1279,6 @@ class StagedRelationExtractor:
         self.llm_global_concurrency = configure_global_llm_concurrency(
             configured_llm_global_concurrency
         )
-        self.llm_call_hard_timeout = float(self.config.get("llm_call_hard_timeout", 180.0))
         effective_global_concurrency = get_global_llm_concurrency()
         if (
             effective_global_concurrency is not None
@@ -1275,22 +1289,13 @@ class StagedRelationExtractor:
                 effective_global_concurrency,
                 configured_llm_global_concurrency,
             )
-        self.llm_client = LangChainJsonLLMClient(
+        self.llm_client = build_json_llm_client_from_config(
             self.lc_llm,
+            config=self.config,
             logger=self.logger,
-            max_retries=max(0, int(self.config.get("max_retries", 8))),
-            retry_delay=float(self.config.get("retry_delay", 2.0)),
-            retry_backoff_factor=float(self.config.get("retry_backoff_factor", 2.5)),
-            retry_max_delay=float(self.config.get("retry_max_delay", 120.0)),
-            hard_timeout=self.llm_call_hard_timeout,
             llm_global_concurrency=self.llm_global_concurrency,
             print_call_counter=True,
             slow_call_threshold=30.0,
-            recycle_on_connection_error=bool(
-                self.config.get("llm_socket_recycle_on_connection_error", True)
-            ),
-            recycle_after_calls=int(self.config.get("llm_socket_recycle_after_calls", 0)),
-            recycle_min_interval=float(self.config.get("llm_socket_recycle_min_interval", 5.0)),
         )
         self.brand_alias_map: Dict[str, List[str]] = {}
         self.brand_candidates_all: List[Dict] = []
@@ -1399,18 +1404,88 @@ class StagedRelationExtractor:
         del metadata
         return await self.llm_client.call_json(messages, schema, schema_name)
 
+    def _llm_text_max_chars(self) -> int:
+        return max(800, int(self.config.get("max_chars_per_call", 8000)))
+
+    def _llm_list_prompt_max_chars(self) -> int:
+        configured = int(self.config.get("llm_list_batch_max_chars", 0))
+        if configured > 0:
+            return configured
+        return max(1600, int(self._llm_text_max_chars() * 0.75))
+
+    def _chunk_prompt_items(
+        self,
+        items: Sequence[Dict],
+        *,
+        max_items: int,
+        max_chars: int,
+    ) -> List[List[Dict]]:
+        if not items:
+            return []
+        safe_max_items = max(1, int(max_items))
+        safe_max_chars = max(0, int(max_chars))
+        batches: List[List[Dict]] = []
+        current: List[Dict] = []
+        current_chars = 0
+        for item in items:
+            serialized = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            item_chars = max(1, len(serialized))
+            overflow_count = len(current) >= safe_max_items
+            overflow_chars = (
+                safe_max_chars > 0
+                and bool(current)
+                and (current_chars + item_chars > safe_max_chars)
+            )
+            if overflow_count or overflow_chars:
+                batches.append(current)
+                current = []
+                current_chars = 0
+            current.append(item)
+            current_chars += item_chars
+        if current:
+            batches.append(current)
+        return batches
+
+    def _split_text_for_llm(self, text: str) -> List[str]:
+        return _split_text(text, self._llm_text_max_chars())
+
     # -------------------------- Stage A: brand ----------------------------- #
     async def _extract_brands_single(
         self, text: str, metadata: Dict, error_log: Path
     ) -> List[Dict]:
-        try:
-            payload = await self._acall(
-                build_brand_messages(text, str(metadata.get("page", ""))),
-                BRAND_SCHEMA,
-                "brand_schema",
-                metadata,
-            )
-            brands = []
+        chunks = self._split_text_for_llm(text)
+        brands: List[Dict] = []
+        for chunk_idx, chunk_text in enumerate(chunks):
+            try:
+                payload = await self._acall(
+                    build_brand_messages(chunk_text, str(metadata.get("page", ""))),
+                    BRAND_SCHEMA,
+                    "brand_schema",
+                    {
+                        **metadata,
+                        "chunk_index": chunk_idx + 1,
+                        "chunk_total": len(chunks),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "brand_extract",
+                    {
+                        **metadata,
+                        "chunk_index": chunk_idx + 1,
+                        "chunk_total": len(chunks),
+                    },
+                    exc,
+                )
+                self.logger.error(
+                    "Brand extract failed on page %s chunk %s/%s: %s",
+                    metadata.get("page"),
+                    chunk_idx + 1,
+                    len(chunks),
+                    exc,
+                )
+                continue
             for item in payload.get("brands", []):
                 name = (item.get("name") or "").strip()
                 if not name:
@@ -1422,24 +1497,45 @@ class StagedRelationExtractor:
                         "pages": item.get("pages") or [metadata.get("page")],
                     }
                 )
-            return brands
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "brand_extract", metadata, exc)
-            self.logger.error("Brand extract failed on page %s: %s", metadata.get("page"), exc)
-            return []
+        return _merge_brand_candidates(brands)
 
     async def _extract_brands_cluster(
         self, text: str, page_labels: List, error_log: Path
     ) -> List[Dict]:
         """Secondary pass: run brand extraction on clustered multi-page text."""
-        try:
-            payload = await self._acall(
-                build_brand_messages(text, f"pages {page_labels}"),
-                BRAND_SCHEMA,
-                "brand_schema",
-                {"pages": page_labels},
-            )
-            brands = []
+        chunks = self._split_text_for_llm(text)
+        brands: List[Dict] = []
+        for chunk_idx, chunk_text in enumerate(chunks):
+            try:
+                payload = await self._acall(
+                    build_brand_messages(chunk_text, f"pages {page_labels}"),
+                    BRAND_SCHEMA,
+                    "brand_schema",
+                    {
+                        "pages": page_labels,
+                        "chunk_index": chunk_idx + 1,
+                        "chunk_total": len(chunks),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "brand_extract_cluster",
+                    {
+                        "pages": page_labels,
+                        "chunk_index": chunk_idx + 1,
+                        "chunk_total": len(chunks),
+                    },
+                    exc,
+                )
+                self.logger.error(
+                    "Brand extract (cluster) failed on pages %s chunk %s/%s: %s",
+                    page_labels,
+                    chunk_idx + 1,
+                    len(chunks),
+                    exc,
+                )
+                continue
             for item in payload.get("brands", []):
                 name = (item.get("name") or "").strip()
                 if not name:
@@ -1451,11 +1547,7 @@ class StagedRelationExtractor:
                         "pages": item.get("pages") or page_labels,
                     }
                 )
-            return brands
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "brand_extract_cluster", {"pages": page_labels}, exc)
-            self.logger.error("Brand extract (cluster) failed on pages %s: %s", page_labels, exc)
-            return []
+        return _merge_brand_candidates(brands)
 
     def _cluster_pages_for_brands(
         self, pages: Sequence[Tuple[str, Dict]], cluster_size: int
@@ -1577,20 +1669,47 @@ class StagedRelationExtractor:
                         "pages": len(_dedup_list(b.get("pages", []))),
                         "evidence": (b.get("evidence") or [])[:3],
                     }
-                    for b in cluster_sorted[:5]
+                    for b in cluster_sorted
                 ]
-                try:
-                    result = await self._acall(
-                        build_brand_filter_messages(candidate_payload),
-                        BRAND_FILTER_SCHEMA,
-                        "brand_filter_schema",
-                        {"cluster_size": len(cluster_sorted)},
-                    )
-                    keep_names = [n.strip() for n in result.get("keep", []) if n and n.strip()]
-                except Exception as exc:  # noqa: BLE001
-                    _append_error(error_log, "brand_refine", {"cluster": candidate_payload}, exc)
-                    self.logger.error("Brand refine failed on cluster %s: %s", candidate_payload, exc)
-                    keep_names = []
+                keep_names: List[str] = []
+                batch_size = int(self.config.get("brand_refine_batch_size", 20))
+                payload_batches = self._chunk_prompt_items(
+                    candidate_payload,
+                    max_items=batch_size,
+                    max_chars=self._llm_list_prompt_max_chars(),
+                )
+                for batch_idx, payload_batch in enumerate(payload_batches):
+                    try:
+                        result = await self._acall(
+                            build_brand_filter_messages(payload_batch),
+                            BRAND_FILTER_SCHEMA,
+                            "brand_filter_schema",
+                            {
+                                "cluster_size": len(cluster_sorted),
+                                "batch_index": batch_idx + 1,
+                                "batch_total": len(payload_batches),
+                            },
+                        )
+                        keep_names.extend(
+                            [n.strip() for n in result.get("keep", []) if n and n.strip()]
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _append_error(
+                            error_log,
+                            "brand_refine",
+                            {
+                                "cluster": payload_batch,
+                                "batch_index": batch_idx + 1,
+                                "batch_total": len(payload_batches),
+                            },
+                            exc,
+                        )
+                        self.logger.error(
+                            "Brand refine failed on cluster batch %s/%s: %s",
+                            batch_idx + 1,
+                            len(payload_batches),
+                            exc,
+                        )
 
                 # choose canonical brand: prefer LLM keep, else top by pages
                 chosen = None
@@ -1700,23 +1819,59 @@ class StagedRelationExtractor:
                 "pages": len(_dedup_list(item.get("pages", []))),
                 "evidence": (item.get("evidence") or [])[:3],
             }
-            for item in candidates[:12]
+            for item in candidates
         ]
-        try:
-            result = await self._acall(
-                build_brand_primary_messages(payload),
-                BRAND_FILTER_SCHEMA,
-                "brand_primary_schema",
-                {"stage": "brand_primary"},
-            )
-            keep_names = [_normalize_brand_key(name) for name in result.get("keep", []) if name]
-            if keep_names:
-                kept = [item for item in candidates if _normalize_brand_key(item.get("name", "")) in set(keep_names)]
-                if kept:
-                    return [kept[0]]
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "brand_primary", {}, exc)
-            self.logger.error("Brand primary selection failed: %s", exc)
+        batch_size = int(self.config.get("brand_primary_batch_size", 20))
+        payload_batches = self._chunk_prompt_items(
+            payload,
+            max_items=batch_size,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        keep_keys: set[str] = set()
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_brand_primary_messages(payload_batch),
+                    BRAND_FILTER_SCHEMA,
+                    "brand_primary_schema",
+                    {
+                        "stage": "brand_primary",
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+                keep_keys.update(
+                    {
+                        _normalize_brand_key(name)
+                        for name in result.get("keep", [])
+                        if name
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "brand_primary",
+                    {
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.error(
+                    "Brand primary selection failed on batch %s/%s: %s",
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
+
+        if keep_keys:
+            kept = [
+                item
+                for item in candidates
+                if _normalize_brand_key(item.get("name", "")) in keep_keys
+            ]
+            if kept:
+                return [kept[0]]
 
         # deterministic fallback by page coverage if LLM selection fails.
         return [candidates[0]]
@@ -1730,20 +1885,46 @@ class StagedRelationExtractor:
             {"name": b.get("name", ""), "evidence": (b.get("evidence") or [])[:3]}
             for b in brands
         ]
-        try:
-            result = await self._acall(
-                build_brand_canon_messages(payload),
-                BRAND_CANON_SCHEMA,
-                "brand_canon_schema",
-                {"count": len(brands)},
-            )
-            mapping = {
-                _normalize_brand_key(item.get("original", "")): item.get("canonical_cn", "").strip()
-                for item in result.get("items", [])
-            }
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "brand_canon", {}, exc)
-            self.logger.error("Brand canonicalization failed: %s", exc)
+        mapping: Dict[str, str] = {}
+        batch_size = int(self.config.get("brand_canon_batch_size", 32))
+        payload_batches = self._chunk_prompt_items(
+            payload,
+            max_items=batch_size,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_brand_canon_messages(payload_batch),
+                    BRAND_CANON_SCHEMA,
+                    "brand_canon_schema",
+                    {
+                        "count": len(brands),
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+                for item in result.get("items", []):
+                    mapping[_normalize_brand_key(item.get("original", ""))] = (
+                        item.get("canonical_cn", "").strip()
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "brand_canon",
+                    {
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.error(
+                    "Brand canonicalization failed on batch %s/%s: %s",
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
+        if not mapping:
             return brands, {}
 
         merged: Dict[str, Dict] = {}
@@ -2003,9 +2184,19 @@ class StagedRelationExtractor:
         if not brand or not series_names or not relevant_pages:
             return
 
+        series_candidates = _dedup_list(
+            [str(name).strip() for name in (series_names or []) if str(name).strip()]
+        )
+        if not series_candidates:
+            return
+
+        series_batch_size = max(
+            1,
+            int(self.config.get("series_feature_series_batch_size", 8)),
+        )
         chunk_size = self._resolve_series_chunk_size()
         page_chunks = _chunk_sequence(relevant_pages, chunk_size)
-        for chunk_pages in page_chunks:
+        for page_chunk_idx, chunk_pages in enumerate(page_chunks):
             combined = _combine_pages(chunk_pages, self.config)
             chunk_refs = _dedup_list(
                 [
@@ -2014,62 +2205,99 @@ class StagedRelationExtractor:
                     if meta.get("page") is not None and str(meta.get("page")) != ""
                 ]
             )
-            try:
-                payload = await self._acall(
-                    build_series_feature_messages(
-                        brand,
-                        series_names,
-                        combined,
-                        chunk_pages=chunk_refs,
-                    ),
-                    SERIES_FEATURE_SCHEMA,
-                    "series_feature_schema",
-                    {"brand": brand, "series_count": len(series_names), "chunk_pages": chunk_refs},
-                )
-            except Exception as exc:  # noqa: BLE001
-                _append_error(
-                    error_log,
-                    "series_feature_extract",
-                    {"brand": brand, "chunk_pages": chunk_refs},
-                    exc,
-                )
-                self.logger.warning(
-                    "Stage B series_feature extract failed for brand=%s pages=%s: %s",
-                    brand,
-                    chunk_refs,
-                    exc,
-                )
-                continue
+            text_chunks = self._split_text_for_llm(combined)
+            series_batches = _chunk_sequence(series_candidates, series_batch_size)
+            for text_chunk_idx, text_chunk in enumerate(text_chunks):
+                for series_batch_idx, series_batch in enumerate(series_batches):
+                    try:
+                        payload = await self._acall(
+                            build_series_feature_messages(
+                                brand,
+                                list(series_batch),
+                                text_chunk,
+                                chunk_pages=chunk_refs,
+                            ),
+                            SERIES_FEATURE_SCHEMA,
+                            "series_feature_schema",
+                            {
+                                "brand": brand,
+                                "series_count": len(series_candidates),
+                                "chunk_pages": chunk_refs,
+                                "page_chunk_index": page_chunk_idx + 1,
+                                "page_chunk_total": len(page_chunks),
+                                "text_chunk_index": text_chunk_idx + 1,
+                                "text_chunk_total": len(text_chunks),
+                                "series_batch_index": series_batch_idx + 1,
+                                "series_batch_total": len(series_batches),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _append_error(
+                            error_log,
+                            "series_feature_extract",
+                            {
+                                "brand": brand,
+                                "chunk_pages": chunk_refs,
+                                "page_chunk_index": page_chunk_idx + 1,
+                                "page_chunk_total": len(page_chunks),
+                                "text_chunk_index": text_chunk_idx + 1,
+                                "text_chunk_total": len(text_chunks),
+                                "series_batch_index": series_batch_idx + 1,
+                                "series_batch_total": len(series_batches),
+                            },
+                            exc,
+                        )
+                        self.logger.warning(
+                            "Stage B series_feature extract failed brand=%s pages=%s page_chunk=%s/%s text_chunk=%s/%s series_batch=%s/%s: %s",
+                            brand,
+                            chunk_refs,
+                            page_chunk_idx + 1,
+                            len(page_chunks),
+                            text_chunk_idx + 1,
+                            len(text_chunks),
+                            series_batch_idx + 1,
+                            len(series_batches),
+                            exc,
+                        )
+                        continue
 
-            alias_map = self.series_alias_map.get(brand, {})
-            for item in payload.get("items", []) or []:
-                series_guess = str(item.get("series") or "").strip()
-                canonical = _match_series_name(series_guess, brand, alias_map)
-                if not canonical:
-                    # fallback: direct hit on current series list
-                    for s in series_names:
-                        if _series_merge_key(s) == _series_merge_key(series_guess):
-                            canonical = s
-                            break
-                if not canonical:
-                    continue
+                    alias_map = self.series_alias_map.get(brand, {})
+                    for item in payload.get("items", []) or []:
+                        series_guess = str(item.get("series") or "").strip()
+                        canonical = _match_series_name(series_guess, brand, alias_map)
+                        if not canonical:
+                            # fallback: direct hit on current series list
+                            for s in series_candidates:
+                                if _series_merge_key(s) == _series_merge_key(series_guess):
+                                    canonical = s
+                                    break
+                        if not canonical:
+                            continue
 
-                entry = {
-                    "title": str(item.get("title") or "").strip() or canonical,
-                    "fact_text": _dedup_list([str(x).strip() for x in (item.get("fact_text") or []) if str(x).strip()]),
-                    "features": _dedup_list([str(x).strip() for x in (item.get("features") or []) if str(x).strip()]),
-                    "key_components": _dedup_list([str(x).strip() for x in (item.get("key_components") or []) if str(x).strip()]),
-                    "performance_specs": [],
-                    "evidence": _dedup_list([str(x).strip() for x in (item.get("evidence") or []) if str(x).strip()]),
-                    "source_category": source_category,
-                    "series_feature_flag": True,
-                }
-                pages_field = item.get("pages") or []
-                if pages_field:
-                    entry["pages"] = _dedup_list(pages_field)
-                self._store_series_feature_entry(brand, canonical, entry)
-                if entry.get("key_components"):
-                    self._store_series_components(brand, canonical, entry.get("key_components") or [])
+                        entry = {
+                            "title": str(item.get("title") or "").strip() or canonical,
+                            "fact_text": _dedup_list(
+                                [str(x).strip() for x in (item.get("fact_text") or []) if str(x).strip()]
+                            ),
+                            "features": _dedup_list(
+                                [str(x).strip() for x in (item.get("features") or []) if str(x).strip()]
+                            ),
+                            "key_components": _dedup_list(
+                                [str(x).strip() for x in (item.get("key_components") or []) if str(x).strip()]
+                            ),
+                            "performance_specs": [],
+                            "evidence": _dedup_list(
+                                [str(x).strip() for x in (item.get("evidence") or []) if str(x).strip()]
+                            ),
+                            "source_category": source_category,
+                            "series_feature_flag": True,
+                        }
+                        pages_field = item.get("pages") or []
+                        if pages_field:
+                            entry["pages"] = _dedup_list(pages_field)
+                        self._store_series_feature_entry(brand, canonical, entry)
+                        if entry.get("key_components"):
+                            self._store_series_components(brand, canonical, entry.get("key_components") or [])
 
     def _store_series_feature_entry(
         self,
@@ -2149,21 +2377,49 @@ class StagedRelationExtractor:
             }
             for s in candidates
         ]
-        try:
-            result = await self._acall(
-                build_series_review_messages(brand, payload),
-                SERIES_REVIEW_SCHEMA,
-                "series_review_schema",
-                {"brand": brand, "count": len(payload)},
-            )
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "series_review", {"brand": brand}, exc)
-            self.logger.error("Series review failed for brand %s: %s", brand, exc)
-            return candidates, {}
+        review_items: List[Dict] = []
+        batch_size = int(self.config.get("series_review_batch_size", 64))
+        payload_batches = self._chunk_prompt_items(
+            payload,
+            max_items=batch_size,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_series_review_messages(brand, payload_batch),
+                    SERIES_REVIEW_SCHEMA,
+                    "series_review_schema",
+                    {
+                        "brand": brand,
+                        "count": len(payload),
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+                review_items.extend(result.get("items", []))
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "series_review",
+                    {
+                        "brand": brand,
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.error(
+                    "Series review failed for brand %s batch %s/%s: %s",
+                    brand,
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
 
         # map by normalized original name for robust matching
         review_map: Dict[str, Dict] = {}
-        for item in result.get("items", []):
+        for item in review_items:
             original_name = item.get("original", "")
             for key in (
                 _series_merge_key(original_name),
@@ -2341,18 +2597,46 @@ class StagedRelationExtractor:
             for group_key, meta in group_meta.items()
         ]
 
-        try:
-            result = await self._acall(
-                build_series_canon_messages(brand, groups_payload),
-                SERIES_CANON_SCHEMA,
-                "series_canon_schema",
-                {"brand": brand, "groups": len(groups_payload)},
-            )
-            canon_items = result.get("items", []) if isinstance(result, dict) else []
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "series_canon", {"brand": brand}, exc)
-            self.logger.warning("Series canonicalization failed for brand %s: %s", brand, exc)
-            return reviewed, alias_map or {}
+        canon_items: List[Dict] = []
+        batch_size = int(self.config.get("series_canon_batch_size", 64))
+        payload_batches = self._chunk_prompt_items(
+            groups_payload,
+            max_items=batch_size,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_series_canon_messages(brand, payload_batch),
+                    SERIES_CANON_SCHEMA,
+                    "series_canon_schema",
+                    {
+                        "brand": brand,
+                        "groups": len(groups_payload),
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+                if isinstance(result, dict):
+                    canon_items.extend(result.get("items", []) or [])
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "series_canon",
+                    {
+                        "brand": brand,
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.warning(
+                    "Series canonicalization failed for brand %s batch %s/%s: %s",
+                    brand,
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
 
         mapping: Dict[str, str] = {}
         for row in canon_items:
@@ -2680,20 +2964,58 @@ class StagedRelationExtractor:
         if not products:
             return []
         max_items = int(self.config.get("product_review_max_items", 50))
-        payload = products[:max_items]
-        untouched_tail = products[max_items:]
-        try:
-            result = await self._acall(
-                build_product_review_messages(brand, series, payload),
-                PRODUCT_REVIEW_SCHEMA,
-                "product_review_schema",
-                {"brand": brand, "series": series, "count": len(payload)},
-            )
-            verdicts = {item.get("product_model", "").strip(): item for item in result.get("products", [])}
+        payload_batches = self._chunk_prompt_items(
+            products,
+            max_items=max_items,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        reviewed: List[Dict] = []
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_product_review_messages(brand, series, payload_batch),
+                    PRODUCT_REVIEW_SCHEMA,
+                    "product_review_schema",
+                    {
+                        "brand": brand,
+                        "series": series,
+                        "count": len(products),
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "product_review",
+                    {
+                        "brand": brand,
+                        "series": series,
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.warning(
+                    "Product LLM review failed for %s/%s batch %s/%s: %s",
+                    brand,
+                    series,
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
+                reviewed.extend(payload_batch)
+                continue
+
+            verdicts = {
+                item.get("product_model", "").strip(): item
+                for item in result.get("products", [])
+            }
             if not verdicts:
-                return products
-            reviewed: List[Dict] = []
-            for prod in payload:
+                reviewed.extend(payload_batch)
+                continue
+
+            for prod in payload_batch:
                 model_key = (prod.get("product_model") or "").strip()
                 decision = verdicts.get(model_key)
                 if decision is None:
@@ -2717,12 +3039,7 @@ class StagedRelationExtractor:
                     continue
                 if decision.get("keep") and role == "product" and not decision.get("is_accessory"):
                     reviewed.append(prod)
-            reviewed.extend(untouched_tail)
-            return reviewed
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "product_review", {"brand": brand, "series": series}, exc)
-            self.logger.warning("Product LLM review failed for %s/%s: %s", brand, series, exc)
-            return products
+        return reviewed
 
     def _store_series_feature(
         self,
@@ -2937,24 +3254,58 @@ class StagedRelationExtractor:
         if not candidates:
             return []
         max_items = int(self.config.get("model_review_max_items", 80))
-        payload = candidates[:max_items]
-        untouched_tail = candidates[max_items:]
-        try:
-            result = await self._acall(
-                build_model_review_messages(brand, series, payload),
-                MODEL_REVIEW_SCHEMA,
-                "model_review_schema",
-                {"brand": brand, "series": series, "count": len(payload)},
-            )
+        payload_batches = self._chunk_prompt_items(
+            candidates,
+            max_items=max_items,
+            max_chars=self._llm_list_prompt_max_chars(),
+        )
+        reviewed: List[Dict] = []
+        alias_map = getattr(self, "series_alias_map", {})
+        allow_redirect = True
+        drop_mismatch = False
+        redirect_conf = float(self.config.get("model_redirect_min_conf", 0.5))
+        for batch_idx, payload_batch in enumerate(payload_batches):
+            try:
+                result = await self._acall(
+                    build_model_review_messages(brand, series, payload_batch),
+                    MODEL_REVIEW_SCHEMA,
+                    "model_review_schema",
+                    {
+                        "brand": brand,
+                        "series": series,
+                        "count": len(candidates),
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_error(
+                    error_log,
+                    "model_review",
+                    {
+                        "brand": brand,
+                        "series": series,
+                        "batch_index": batch_idx + 1,
+                        "batch_total": len(payload_batches),
+                    },
+                    exc,
+                )
+                self.logger.warning(
+                    "Model LLM review failed for %s/%s batch %s/%s: %s",
+                    brand,
+                    series,
+                    batch_idx + 1,
+                    len(payload_batches),
+                    exc,
+                )
+                reviewed.extend(payload_batch)
+                continue
+
             verdicts = {item.get("name", "").strip(): item for item in result.get("items", [])}
             if not verdicts:
-                return candidates
-            reviewed: List[Dict] = []
-            alias_map = getattr(self, "series_alias_map", {})
-            allow_redirect = True
-            drop_mismatch = False
-            redirect_conf = float(self.config.get("model_redirect_min_conf", 0.5))
-            for cand in payload:
+                reviewed.extend(payload_batch)
+                continue
+            for cand in payload_batch:
                 name = (cand.get("name") or "").strip()
                 decision = verdicts.get(name)
                 if decision is None:
@@ -2992,12 +3343,7 @@ class StagedRelationExtractor:
                     continue
                 reviewed.append(cand)
 
-            reviewed.extend(untouched_tail)
-            return reviewed
-        except Exception as exc:  # noqa: BLE001
-            _append_error(error_log, "model_review", {"brand": brand, "series": series}, exc)
-            self.logger.warning("Model LLM review failed for %s/%s: %s", brand, series, exc)
-            return candidates
+        return reviewed
 
     async def extract_models(
         self,
@@ -4549,21 +4895,6 @@ def _deduplicate_products_by_model(products: List[Dict], config: Optional[Dict] 
     return merged_products
 
 
-def _build_multistage_runtime_config(
-    *,
-    max_concurrent: int,
-    llm_global_concurrency: Optional[int],
-    max_retries: Optional[int],
-    llm_call_hard_timeout: Optional[float],
-) -> Dict:
-    return build_staged_runtime_config(
-        max_concurrent=max_concurrent,
-        llm_global_concurrency=llm_global_concurrency,
-        max_retries=max_retries,
-        llm_call_hard_timeout=llm_call_hard_timeout,
-    )
-
-
 async def extract_relations_multistage_with_extractor(
     extractor: "StagedRelationExtractor",
     *,
@@ -4789,6 +5120,7 @@ def extract_relations_multistage(
     error_log_path: Path,
     max_concurrent: int = 100,
     llm_global_concurrency: Optional[int] = None,
+    llm_global_rpm: Optional[float] = None,
     window_size: int = 1,
     use_sliding_window: bool = True,
     show_progress: bool = False,
@@ -4798,9 +5130,10 @@ def extract_relations_multistage(
     """
     Orchestrate multi-stage extraction end-to-end. Output shape matches v1.
     """
-    cfg = _build_multistage_runtime_config(
+    cfg = build_staged_runtime_config(
         max_concurrent=max_concurrent,
         llm_global_concurrency=llm_global_concurrency,
+        llm_global_rpm=llm_global_rpm,
         max_retries=max_retries,
         llm_call_hard_timeout=llm_call_hard_timeout,
     )

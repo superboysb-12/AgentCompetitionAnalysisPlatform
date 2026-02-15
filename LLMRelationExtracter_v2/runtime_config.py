@@ -13,6 +13,7 @@ def build_staged_runtime_config(
     *,
     max_concurrent: Optional[int] = None,
     llm_global_concurrency: Optional[int] = None,
+    llm_global_rpm: Optional[float] = None,
     max_retries: Optional[int] = None,
     llm_call_hard_timeout: Optional[float] = None,
 ) -> Dict:
@@ -26,10 +27,11 @@ def build_staged_runtime_config(
         cfg["global_concurrency"] = safe_max_concurrent
     if llm_global_concurrency is not None:
         cfg["llm_global_concurrency"] = max(1, int(llm_global_concurrency))
+    if llm_global_rpm is not None:
+        cfg["llm_global_rpm"] = max(0.0, float(llm_global_rpm))
     if max_retries is not None:
         cfg["max_retries"] = max(0, int(max_retries))
     if llm_call_hard_timeout is not None:
         cfg["llm_call_hard_timeout"] = max(1.0, float(llm_call_hard_timeout))
     cfg.setdefault("max_chars_per_call", 8000)
     return cfg
-

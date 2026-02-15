@@ -49,6 +49,7 @@ OUTPUT_DIR = None  # set to Path(r"...") to override
 
 MAX_CONCURRENT = 100
 LLM_GLOBAL_CONCURRENCY = 10
+LLM_GLOBAL_RPM = 0.0
 MAX_RETRIES = 8
 LLM_CALL_HARD_TIMEOUT = 180.0
 WINDOW_SIZE = 1
@@ -223,6 +224,7 @@ def run_md_extract(
     output_dir: Optional[Path] = None,
     max_concurrent: int = 100,
     llm_global_concurrency: int = 10,
+    llm_global_rpm: float = 0.0,
     max_retries: int = 8,
     llm_call_hard_timeout: float = 180.0,
     window_size: int = 1,
@@ -242,6 +244,7 @@ def run_md_extract(
     print(
         "[v2 md test] Options: "
         f"max_concurrent={max_concurrent}, llm_global_concurrency={llm_global_concurrency}, "
+        f"llm_global_rpm={llm_global_rpm}, "
         f"window_size={window_size}, sliding={use_sliding_window}, "
         f"max_retries={max_retries}, llm_call_hard_timeout={llm_call_hard_timeout}, "
         f"drop_id_only={drop_id_only}, min_text_chars={min_text_chars}"
@@ -250,6 +253,7 @@ def run_md_extract(
     cfg = build_staged_runtime_config(
         max_concurrent=max_concurrent,
         llm_global_concurrency=llm_global_concurrency,
+        llm_global_rpm=llm_global_rpm,
         max_retries=max_retries,
         llm_call_hard_timeout=llm_call_hard_timeout,
     )
@@ -281,6 +285,7 @@ def main() -> None:
         output_dir=OUTPUT_DIR,
         max_concurrent=MAX_CONCURRENT,
         llm_global_concurrency=LLM_GLOBAL_CONCURRENCY,
+        llm_global_rpm=LLM_GLOBAL_RPM,
         max_retries=MAX_RETRIES,
         llm_call_hard_timeout=LLM_CALL_HARD_TIMEOUT,
         window_size=WINDOW_SIZE,

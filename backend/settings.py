@@ -153,7 +153,16 @@ RELATION_EXTRACTOR_CONFIG = {
     "llm_global_concurrency": int(
         os.getenv("LLM_GLOBAL_CONCURRENCY", 10)
     ),
+    # Global request pacing in requests-per-minute.
+    # <=0 means fallback to llm_global_concurrency as RPM for compatibility.
+    "llm_global_rpm": float(os.getenv("LLM_GLOBAL_RPM", 0)),
     "timeout": int(os.getenv("REQUEST_TIMEOUT", 3000)),  # ??????(?),??3??
+    # httpx connection pool controls for ChatOpenAI transport.
+    "llm_http_max_connections": int(os.getenv("LLM_HTTP_MAX_CONNECTIONS", 200)),
+    "llm_http_max_keepalive_connections": int(
+        os.getenv("LLM_HTTP_MAX_KEEPALIVE_CONNECTIONS", 100)
+    ),
+    "llm_http_keepalive_expiry": float(os.getenv("LLM_HTTP_KEEPALIVE_EXPIRY", 30.0)),
     # Hard timeout guard for each single llm.ainvoke call (seconds).
     "llm_call_hard_timeout": float(os.getenv("LLM_CALL_HARD_TIMEOUT", 180.0)),
     # Socket recycle strategy for unstable network / pooled connections.
@@ -166,6 +175,10 @@ RELATION_EXTRACTOR_CONFIG = {
     "llm_socket_recycle_min_interval": float(
         os.getenv("LLM_SOCKET_RECYCLE_MIN_INTERVAL", 5.0)
     ),
+    "llm_socket_recycle_defer_close_seconds": float(
+        os.getenv("LLM_SOCKET_RECYCLE_DEFER_CLOSE_SECONDS", 120.0)
+    ),
+    "llm_retry_log_path": os.getenv("LLM_RETRY_LOG_PATH", "logs/llm_retry_events.jsonl"),
 
     # Retry config (basic finite exponential backoff)
     "max_retries": int(os.getenv("MAX_RETRIES", 8)),
@@ -232,6 +245,8 @@ RELATION_EXTRACTOR_CONFIG = {
 
     # Prompt length guard
     "max_chars_per_call": int(os.getenv("MAX_CHARS_PER_CALL", 8000)),
+    # 0 means auto = 75% of max_chars_per_call.
+    "llm_list_batch_max_chars": int(os.getenv("LLM_LIST_BATCH_MAX_CHARS", 0)),
     "chunk_progress_preview_chars": int(os.getenv("CHUNK_PROGRESS_PREVIEW_CHARS", 64)),
     "table_rows_per_block": int(os.getenv("TABLE_ROWS_PER_BLOCK", 12)),
     "table_row_cell_clip": int(os.getenv("TABLE_ROW_CELL_CLIP", 0)),
@@ -255,6 +270,12 @@ RELATION_EXTRACTOR_CONFIG = {
     "series_brand_follow_pages": int(os.getenv("SERIES_BRAND_FOLLOW_PAGES", 1)),
     # Stage-B page grouping size for each LLM call; extractor coerces to 2 or 3.
     "series_brand_chunk_pages": int(os.getenv("SERIES_BRAND_CHUNK_PAGES", 2)),
+    "series_feature_series_batch_size": int(os.getenv("SERIES_FEATURE_SERIES_BATCH_SIZE", 8)),
+    "series_review_batch_size": int(os.getenv("SERIES_REVIEW_BATCH_SIZE", 64)),
+    "series_canon_batch_size": int(os.getenv("SERIES_CANON_BATCH_SIZE", 64)),
+    "brand_refine_batch_size": int(os.getenv("BRAND_REFINE_BATCH_SIZE", 20)),
+    "brand_primary_batch_size": int(os.getenv("BRAND_PRIMARY_BATCH_SIZE", 20)),
+    "brand_canon_batch_size": int(os.getenv("BRAND_CANON_BATCH_SIZE", 32)),
     # Legacy field kept for compatibility with older scripts.
     "series_page_chunk_size": int(os.getenv("SERIES_PAGE_CHUNK_SIZE", 4)),
     "model_redirect_min_conf": float(os.getenv("MODEL_REDIRECT_MIN_CONF", 0.5)),
