@@ -41,7 +41,7 @@ SHOW_PROGRESS = True
 
 
 def _has_markdown_files(directory: Path) -> bool:
-    return any(path.is_file() for path in directory.rglob("*_result.md"))
+    return any(path.is_file() for path in directory.rglob("*.md"))
 
 
 def _resolve_targets(input_path: Path, mode: str) -> list[Path]:
@@ -52,7 +52,7 @@ def _resolve_targets(input_path: Path, mode: str) -> list[Path]:
 
     if mode == "single_dir":
         if not _has_markdown_files(input_path):
-            raise FileNotFoundError(f"No *_result.md found under: {input_path}")
+            raise FileNotFoundError(f"No .md found under: {input_path}")
         return [input_path]
 
     if mode == "children_dirs":
@@ -63,7 +63,7 @@ def _resolve_targets(input_path: Path, mode: str) -> list[Path]:
         ]
         if not targets:
             raise FileNotFoundError(
-                f"No first-level subdirectory with *_result.md found under: {input_path}"
+                f"No first-level subdirectory with .md found under: {input_path}"
             )
         return targets
 

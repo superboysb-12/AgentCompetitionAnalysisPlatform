@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -1253,6 +1254,34 @@ class StagedRelationExtractor:
         self.model_conflicts: Dict[str, Dict] = {}
         self.model_redirects: List[Dict] = []
 
+    async def aclose(self) -> None:
+        """Best-effort close for underlying OpenAI/httpx clients."""
+        llm = getattr(self, "lc_llm", None)
+        if llm is None:
+            return
+
+        # Async client should be closed before event loop teardown.
+        root_async_client = getattr(llm, "root_async_client", None)
+        if root_async_client is not None:
+            close_fn = getattr(root_async_client, "close", None)
+            if callable(close_fn):
+                try:
+                    maybe_coro = close_fn()
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug("Ignore async client close error: %s", exc)
+
+        # Close sync client as well to release sockets immediately.
+        root_client = getattr(llm, "root_client", None)
+        if root_client is not None:
+            close_fn = getattr(root_client, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug("Ignore sync client close error: %s", exc)
+
     def _retrieve_pages(
         self, keywords: List[str], pages: Sequence[Tuple[str, Dict]]
     ) -> List[Tuple[str, Dict]]:
@@ -1330,13 +1359,40 @@ class StagedRelationExtractor:
                 "json_schema": {"name": schema_name, "schema": schema, "strict": True},
             }
         )
-        async with self.semaphore:
-            response = await llm.ainvoke(lc_messages)
+        parse_attempt = 0
+        while True:
+            response = await self._ainvoke_with_retry(llm, lc_messages, schema_name)
+            try:
+                content = self._response_to_text(response)
+                if not content:
+                    raise ValueError(f"Empty response for {schema_name}")
+                return json.loads(content)
+            except Exception as exc:  # noqa: BLE001
+                should_retry = self._should_retry(parse_attempt, exc, treat_as_retryable=True)
+                if not should_retry:
+                    if isinstance(exc, ValueError):
+                        preview = content[:200] if "content" in locals() else ""
+                        raise ValueError(f"Invalid JSON for {schema_name}: {preview}") from exc
+                    raise
+                delay = self._compute_retry_delay(parse_attempt)
+                total = self._retry_total_display()
+                if parse_attempt < 5 or (parse_attempt + 1) % 10 == 0:
+                    self.logger.warning(
+                        "LLM response parse failed for %s, retry %s/%s in %.2fs: %s",
+                        schema_name,
+                        parse_attempt + 1,
+                        total,
+                        delay,
+                        exc,
+                    )
+                parse_attempt += 1
+                await asyncio.sleep(delay)
 
+    def _response_to_text(self, response) -> str:  # noqa: ANN001
         raw_content = getattr(response, "content", "")
         if isinstance(raw_content, str):
-            content = raw_content.strip()
-        elif isinstance(raw_content, list):
+            return raw_content.strip()
+        if isinstance(raw_content, list):
             text_parts: List[str] = []
             for part in raw_content:
                 if isinstance(part, dict):
@@ -1345,16 +1401,106 @@ class StagedRelationExtractor:
                         text_parts.append(text)
                 elif isinstance(part, str):
                     text_parts.append(part)
-            content = "".join(text_parts).strip()
-        else:
-            content = str(raw_content or "").strip()
-        if not content:
-            raise ValueError(f"Empty response for {schema_name}")
-        try:
-            return json.loads(content)
-        except Exception as exc:  # noqa: BLE001
-            preview = content[:200]
-            raise ValueError(f"Invalid JSON for {schema_name}: {preview}") from exc
+            return "".join(text_parts).strip()
+        return str(raw_content or "").strip()
+
+    def _retry_until_success(self) -> bool:
+        return bool(self.config.get("retry_until_success", False))
+
+    def _retry_total_display(self) -> str:
+        if self._retry_until_success():
+            return "inf"
+        return str(max(0, int(self.config.get("max_retries", 8))))
+
+    def _compute_retry_delay(self, attempt: int) -> float:
+        base_delay = max(0.1, float(self.config.get("retry_delay", 2.0)))
+        backoff_factor = max(1.0, float(self.config.get("retry_backoff_factor", 2.5)))
+        max_delay = max(base_delay, float(self.config.get("retry_max_delay", 120.0)))
+        jitter = max(0.0, float(self.config.get("retry_jitter", 0.3)))
+        delay = min(max_delay, base_delay * (backoff_factor ** max(0, attempt)))
+        if jitter > 0:
+            delay = max(0.05, delay * (1 + random.uniform(-jitter, jitter)))
+        return delay
+
+    def _should_retry(self, attempt: int, exc: Exception, treat_as_retryable: bool = False) -> bool:
+        retry_until_success = self._retry_until_success()
+        max_retries = max(0, int(self.config.get("max_retries", 8)))
+        retry_non_retryable = bool(self.config.get("retry_non_retryable_errors", True))
+        is_retryable = treat_as_retryable or self._is_retryable_llm_error(exc)
+        if retry_until_success:
+            return is_retryable or retry_non_retryable
+        if attempt >= max_retries:
+            return False
+        return is_retryable or retry_non_retryable
+
+    def _is_retryable_llm_error(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            if status_code in {408, 409, 425, 429}:
+                return True
+            if status_code >= 500:
+                return True
+
+        exc_name = exc.__class__.__name__.lower()
+        text = str(exc or "").lower()
+        retryable_tokens = (
+            "connection error",
+            "connection reset",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "rate limit",
+            "too many requests",
+            "service unavailable",
+            "gateway timeout",
+            "bad gateway",
+            "server disconnected",
+            "api connection",
+            "api timeout",
+            "stream closed",
+            "network",
+        )
+        retryable_names = (
+            "apiconnectionerror",
+            "apitimeouterror",
+            "ratelimiterror",
+            "internalservererror",
+            "serviceunavailableerror",
+            "connecterror",
+            "readtimeout",
+            "writetimeout",
+            "pooltimeout",
+            "transporterror",
+        )
+        return any(token in text for token in retryable_tokens) or any(
+            token in exc_name for token in retryable_names
+        )
+
+    async def _ainvoke_with_retry(self, llm, lc_messages: List, schema_name: str):  # noqa: ANN001
+        attempt = 0
+        while True:
+            try:
+                async with self.semaphore:
+                    return await llm.ainvoke(lc_messages)
+            except Exception as exc:  # noqa: BLE001
+                if not self._should_retry(attempt, exc):
+                    raise
+                delay = self._compute_retry_delay(attempt)
+                total = self._retry_total_display()
+                if attempt < 5 or (attempt + 1) % 10 == 0:
+                    self.logger.warning(
+                        "LLM call failed for %s, retry %s/%s in %.2fs: %s",
+                        schema_name,
+                        attempt + 1,
+                        total,
+                        delay,
+                        exc,
+                    )
+                attempt += 1
+                await asyncio.sleep(delay)
 
     # -------------------------- Stage A: brand ----------------------------- #
     async def _extract_brands_single(
@@ -4541,65 +4687,87 @@ def extract_relations_multistage(
     force_rerun = cfg.get("force_stage_rerun", False)
 
     async def _run() -> List[Dict]:
-        # Stage A: brands
-        if brand_file.exists() and not force_rerun:
-            brands = json.loads(brand_file.read_text(encoding="utf-8"))
-            if brand_alias_file.exists():
-                extractor.brand_alias_map = json.loads(brand_alias_file.read_text(encoding="utf-8"))
-            if brand_candidates_file.exists():
-                extractor.brand_candidates_all = json.loads(
-                    brand_candidates_file.read_text(encoding="utf-8")
-                )
-            if brand_dropped_file.exists():
-                extractor.brand_dropped = json.loads(brand_dropped_file.read_text(encoding="utf-8"))
-        else:
-            brands = await extractor.run_brand_stage(pages, error_log_path)
-        brand_file.write_text(json.dumps(brands, ensure_ascii=False, indent=2), encoding="utf-8")
-        brand_alias_file.write_text(
-            json.dumps(extractor.brand_alias_map or {}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        brand_candidates_file.write_text(
-            json.dumps(extractor.brand_candidates_all or [], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        brand_dropped_file.write_text(
-            json.dumps(extractor.brand_dropped or [], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        if not brands:
-            return []
-
-        # Stage B: series
-        if series_file.exists() and not force_rerun:
-            brand_to_series = json.loads(series_file.read_text(encoding="utf-8"))
-            if series_alias_file.exists():
-                extractor.series_alias_map = json.loads(series_alias_file.read_text(encoding="utf-8"))
-        else:
-            brand_to_series = await extractor.run_series_stage(brands, pages, error_log_path)
-        brand_to_series, extractor.series_alias_map, _ = _enforce_single_brand_series_scope(
-            brands,
-            brand_to_series,
-            extractor.series_alias_map,
-        )
-        series_file.write_text(json.dumps(brand_to_series, ensure_ascii=False, indent=2), encoding="utf-8")
-        series_alias_file.write_text(
-            json.dumps(extractor.series_alias_map or {}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        # Stage C: models
-        if models_file.exists() and not force_rerun:
-            extractor.models_by_pair = _canonicalize_models_by_pair(
-                json.loads(models_file.read_text(encoding="utf-8"))
+        try:
+            # Stage A: brands
+            if brand_file.exists() and not force_rerun:
+                brands = json.loads(brand_file.read_text(encoding="utf-8"))
+                if brand_alias_file.exists():
+                    extractor.brand_alias_map = json.loads(brand_alias_file.read_text(encoding="utf-8"))
+                if brand_candidates_file.exists():
+                    extractor.brand_candidates_all = json.loads(
+                        brand_candidates_file.read_text(encoding="utf-8")
+                    )
+                if brand_dropped_file.exists():
+                    extractor.brand_dropped = json.loads(brand_dropped_file.read_text(encoding="utf-8"))
+            else:
+                brands = await extractor.run_brand_stage(pages, error_log_path)
+            brand_file.write_text(json.dumps(brands, ensure_ascii=False, indent=2), encoding="utf-8")
+            brand_alias_file.write_text(
+                json.dumps(extractor.brand_alias_map or {}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
-            if model_pages_file.exists():
-                extractor.model_page_stats = json.loads(model_pages_file.read_text(encoding="utf-8"))
-            if model_conflicts_file.exists():
-                extractor.model_conflicts = json.loads(model_conflicts_file.read_text(encoding="utf-8"))
-        else:
-            await extractor.run_model_stage(brand_to_series, pages, error_log_path)
+            brand_candidates_file.write_text(
+                json.dumps(extractor.brand_candidates_all or [], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            brand_dropped_file.write_text(
+                json.dumps(extractor.brand_dropped or [], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            if not brands:
+                return []
+
+            # Stage B: series
+            if series_file.exists() and not force_rerun:
+                brand_to_series = json.loads(series_file.read_text(encoding="utf-8"))
+                if series_alias_file.exists():
+                    extractor.series_alias_map = json.loads(series_alias_file.read_text(encoding="utf-8"))
+            else:
+                brand_to_series = await extractor.run_series_stage(brands, pages, error_log_path)
+            brand_to_series, extractor.series_alias_map, _ = _enforce_single_brand_series_scope(
+                brands,
+                brand_to_series,
+                extractor.series_alias_map,
+            )
+            series_file.write_text(json.dumps(brand_to_series, ensure_ascii=False, indent=2), encoding="utf-8")
+            series_alias_file.write_text(
+                json.dumps(extractor.series_alias_map or {}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            # Stage C: models
+            if models_file.exists() and not force_rerun:
+                extractor.models_by_pair = _canonicalize_models_by_pair(
+                    json.loads(models_file.read_text(encoding="utf-8"))
+                )
+                if model_pages_file.exists():
+                    extractor.model_page_stats = json.loads(model_pages_file.read_text(encoding="utf-8"))
+                if model_conflicts_file.exists():
+                    extractor.model_conflicts = json.loads(model_conflicts_file.read_text(encoding="utf-8"))
+            else:
+                await extractor.run_model_stage(brand_to_series, pages, error_log_path)
+                models_file.write_text(
+                    json.dumps(extractor.models_by_pair, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                model_pages_file.write_text(
+                    json.dumps(extractor.model_page_stats, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                if extractor.model_conflicts:
+                    model_conflicts_file.write_text(
+                        json.dumps(extractor.model_conflicts, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+            extractor.models_by_pair, _ = _enforce_single_brand_models_scope(
+                brands,
+                extractor.models_by_pair,
+            )
+            extractor.model_conflicts, _ = _remap_model_conflicts_to_single_brand(
+                brands,
+                extractor.model_conflicts,
+            )
             models_file.write_text(
                 json.dumps(extractor.models_by_pair, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -4608,77 +4776,58 @@ def extract_relations_multistage(
                 json.dumps(extractor.model_page_stats, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            if extractor.model_conflicts:
+            if extractor.model_conflicts or model_conflicts_file.exists():
                 model_conflicts_file.write_text(
-                    json.dumps(extractor.model_conflicts, ensure_ascii=False, indent=2),
+                    json.dumps(extractor.model_conflicts or {}, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-        extractor.models_by_pair, _ = _enforce_single_brand_models_scope(
-            brands,
-            extractor.models_by_pair,
-        )
-        extractor.model_conflicts, _ = _remap_model_conflicts_to_single_brand(
-            brands,
-            extractor.model_conflicts,
-        )
-        models_file.write_text(
-            json.dumps(extractor.models_by_pair, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        model_pages_file.write_text(
-            json.dumps(extractor.model_page_stats, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        if extractor.model_conflicts or model_conflicts_file.exists():
-            model_conflicts_file.write_text(
-                json.dumps(extractor.model_conflicts or {}, ensure_ascii=False, indent=2),
+
+            if series_features_file.exists() and not force_rerun:
+                extractor.series_feature_map = json.loads(series_features_file.read_text(encoding="utf-8"))
+                extractor._bootstrap_series_components_from_series_features()
+
+            # Stage D: products
+            if products_file.exists() and not force_rerun:
+                products = json.loads(products_file.read_text(encoding="utf-8"))
+            else:
+                products = await extractor.run_product_stage(brand_to_series, pages, error_log_path)
+            products, _ = _enforce_single_brand_products_scope(brands, products)
+            extractor.series_feature_map, _ = _enforce_single_brand_series_feature_scope(
+                brands,
+                extractor.series_feature_map,
+            )
+            products_file.write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding="utf-8")
+            if extractor.series_feature_map or series_features_file.exists():
+                series_features_file.write_text(
+                    json.dumps(extractor.series_feature_map or {}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+            # Hierarchy relation views (always refresh to keep caches consistent).
+            brand_series_relations = _build_brand_series_relations(brands, brand_to_series)
+            series_model_relations = _build_series_model_relations(extractor.models_by_pair)
+            model_specs_relations = _build_model_specs_relations(products)
+            models_explicit = _models_explicit_view(extractor.models_by_pair)
+            brand_series_rel_file.write_text(
+                json.dumps(brand_series_relations, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            series_model_rel_file.write_text(
+                json.dumps(series_model_relations, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            model_specs_rel_file.write_text(
+                json.dumps(model_specs_relations, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            models_explicit_file.write_text(
+                json.dumps(models_explicit, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
-        if series_features_file.exists() and not force_rerun:
-            extractor.series_feature_map = json.loads(series_features_file.read_text(encoding="utf-8"))
-            extractor._bootstrap_series_components_from_series_features()
-
-        # Stage D: products
-        if products_file.exists() and not force_rerun:
-            products = json.loads(products_file.read_text(encoding="utf-8"))
-        else:
-            products = await extractor.run_product_stage(brand_to_series, pages, error_log_path)
-        products, _ = _enforce_single_brand_products_scope(brands, products)
-        extractor.series_feature_map, _ = _enforce_single_brand_series_feature_scope(
-            brands,
-            extractor.series_feature_map,
-        )
-        products_file.write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding="utf-8")
-        if extractor.series_feature_map or series_features_file.exists():
-            series_features_file.write_text(
-                json.dumps(extractor.series_feature_map or {}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-        # Hierarchy relation views (always refresh to keep caches consistent).
-        brand_series_relations = _build_brand_series_relations(brands, brand_to_series)
-        series_model_relations = _build_series_model_relations(extractor.models_by_pair)
-        model_specs_relations = _build_model_specs_relations(products)
-        models_explicit = _models_explicit_view(extractor.models_by_pair)
-        brand_series_rel_file.write_text(
-            json.dumps(brand_series_relations, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        series_model_rel_file.write_text(
-            json.dumps(series_model_relations, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        model_specs_rel_file.write_text(
-            json.dumps(model_specs_relations, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        models_explicit_file.write_text(
-            json.dumps(models_explicit, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        return products
+            return products
+        finally:
+            await extractor.aclose()
 
     raw_products = asyncio.run(_run())
 

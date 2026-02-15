@@ -14,7 +14,7 @@ from backend.settings import RELATION_EXTRACTOR_CONFIG
 
 
 _PART_MD_STEM_RE = re.compile(
-    r"^part_(?P<start>\d+)_(?P<end>\d+)_(?P<sample>.+)_result$",
+    r"^part_(?P<start>\d+)_(?P<end>\d+)_(?P<sample>.+?)(?:_result)?$",
     re.IGNORECASE,
 )
 _TABLE_BLOCK_RE = re.compile(r"(?is)<table\b.*?</table>")
@@ -462,7 +462,7 @@ def load_pages_with_context_from_md_directory(
     known_models: Optional[List[str]] = None,
 ) -> Iterator[Tuple[str, Dict]]:
     """
-    Load pages by aggregating all markdown parts under one directory as one document.
+    Load pages by aggregating all markdown files under one directory as one document.
     """
     dir_path = Path(md_dir_path)
     if not dir_path.exists():
@@ -470,9 +470,9 @@ def load_pages_with_context_from_md_directory(
     if not dir_path.is_dir():
         raise NotADirectoryError(f"Not a directory: {md_dir_path}")
 
-    md_files = sorted(p for p in dir_path.rglob("*_result.md") if p.is_file())
+    md_files = sorted(p for p in dir_path.rglob("*.md") if p.is_file())
     if not md_files:
-        raise FileNotFoundError(f"No *_result.md found under directory: {md_dir_path}")
+        raise FileNotFoundError(f"No .md found under directory: {md_dir_path}")
 
     entries: List[Dict] = []
     for md_file in md_files:
