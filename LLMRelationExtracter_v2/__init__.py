@@ -10,11 +10,13 @@ Brand → Series → Product 分阶段抽取管线，保持与 v1 相同的输�
 from .staged_extractor import (
     StagedRelationExtractor,
     extract_relations_multistage,
+    extract_relations_multistage_with_extractor,
     load_pages_with_context_v2,
 )
 
 __all__ = [
     "StagedRelationExtractor",
     "extract_relations_multistage",
+    "extract_relations_multistage_with_extractor",
     "load_pages_with_context_v2",
 ]

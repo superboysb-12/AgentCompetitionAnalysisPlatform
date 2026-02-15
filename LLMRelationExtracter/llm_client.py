@@ -2,7 +2,7 @@
 Shared LangChain LLM caller utilities for relation extraction.
 
 This module centralizes:
-1) Process-wide RPM pacing for outbound LLM requests.
+1) Process-wide LLM concurrency control for outbound requests.
 2) Unified retry/backoff behavior for network and parse failures.
 3) Strict JSON-schema response handling for ChatOpenAI calls.
 """
@@ -14,36 +14,52 @@ import json
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
-_GLOBAL_LLM_RPM_LOCK = threading.Lock()
-_GLOBAL_LLM_RPM_LIMIT: Optional[int] = None
-_GLOBAL_LLM_NEXT_ALLOWED_TS: float = 0.0
-_GLOBAL_LLM_QUEUE_NEXT_TICKET: int = 0
-_GLOBAL_LLM_QUEUE_SERVING_TICKET: int = 0
+_GLOBAL_LLM_CONCURRENCY_LOCK = threading.Lock()
+_GLOBAL_LLM_CONCURRENCY_LIMIT: Optional[int] = None
+_GLOBAL_LLM_CONCURRENCY_SEMAPHORE: Optional[threading.BoundedSemaphore] = None
 _GLOBAL_LLM_CALL_COUNT_LOCK = threading.Lock()
 _GLOBAL_LLM_CALL_COUNT = 0
+_GLOBAL_CHAT_OPENAI_LOCK = threading.Lock()
+_GLOBAL_CHAT_OPENAI_INSTANCES: Dict[tuple, Any] = {}
+_GLOBAL_CHAT_OPENAI_IDS: set[int] = set()
 
 
-def configure_global_llm_rpm(requests_per_minute: int) -> int:
+def configure_global_llm_concurrency(max_concurrent_calls: int) -> int:
     """
-    Configure process-wide global request cap (RPM).
-    Keep the first initialized RPM for process consistency.
+    Configure process-wide global LLM call concurrency.
+    Keep the first initialized limit for process consistency.
     """
-    global _GLOBAL_LLM_RPM_LIMIT
-    safe_rpm = max(1, int(requests_per_minute))
-    with _GLOBAL_LLM_RPM_LOCK:
-        if _GLOBAL_LLM_RPM_LIMIT is None:
-            _GLOBAL_LLM_RPM_LIMIT = safe_rpm
-            return safe_rpm
-        return _GLOBAL_LLM_RPM_LIMIT
+    global _GLOBAL_LLM_CONCURRENCY_LIMIT, _GLOBAL_LLM_CONCURRENCY_SEMAPHORE
+    safe_limit = max(1, int(max_concurrent_calls))
+    with _GLOBAL_LLM_CONCURRENCY_LOCK:
+        if _GLOBAL_LLM_CONCURRENCY_LIMIT is None:
+            _GLOBAL_LLM_CONCURRENCY_LIMIT = safe_limit
+            _GLOBAL_LLM_CONCURRENCY_SEMAPHORE = threading.BoundedSemaphore(safe_limit)
+            return safe_limit
+        return _GLOBAL_LLM_CONCURRENCY_LIMIT
 
 
-def get_global_llm_rpm() -> Optional[int]:
-    with _GLOBAL_LLM_RPM_LOCK:
-        return _GLOBAL_LLM_RPM_LIMIT
+def get_global_llm_concurrency() -> Optional[int]:
+    with _GLOBAL_LLM_CONCURRENCY_LOCK:
+        return _GLOBAL_LLM_CONCURRENCY_LIMIT
+
+
+def _get_global_llm_semaphore(max_concurrent_calls: int) -> threading.BoundedSemaphore:
+    global _GLOBAL_LLM_CONCURRENCY_SEMAPHORE
+    configure_global_llm_concurrency(max_concurrent_calls)
+    with _GLOBAL_LLM_CONCURRENCY_LOCK:
+        if _GLOBAL_LLM_CONCURRENCY_SEMAPHORE is None:
+            # Defensive fallback; should already be set by configure call above.
+            _GLOBAL_LLM_CONCURRENCY_SEMAPHORE = threading.BoundedSemaphore(
+                max(1, int(max_concurrent_calls))
+            )
+        return _GLOBAL_LLM_CONCURRENCY_SEMAPHORE
 
 
 def mark_global_llm_call_completed(schema_name: str) -> int:
@@ -55,32 +71,59 @@ def mark_global_llm_call_completed(schema_name: str) -> int:
     return current
 
 
-async def acquire_global_llm_queue_slot(requests_per_minute: int) -> None:
+def get_shared_chat_openai(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    temperature: float = 0.0,
+    timeout: float = 300.0,
+) -> Any:
     """
-    Process-wide unified request queue + paced RPM limiter.
-    Every request (including retries) must pass this queue gate.
+    Return a process-wide singleton ChatOpenAI instance for the same config.
     """
-    global _GLOBAL_LLM_NEXT_ALLOWED_TS, _GLOBAL_LLM_QUEUE_NEXT_TICKET, _GLOBAL_LLM_QUEUE_SERVING_TICKET
-    rpm = max(1, int(requests_per_minute))
-    interval = 60.0 / float(rpm)
-    with _GLOBAL_LLM_RPM_LOCK:
-        my_ticket = _GLOBAL_LLM_QUEUE_NEXT_TICKET
-        _GLOBAL_LLM_QUEUE_NEXT_TICKET += 1
+    key = (
+        str(api_key or ""),
+        str(base_url or ""),
+        str(model or ""),
+        float(temperature),
+        float(timeout),
+    )
+    with _GLOBAL_CHAT_OPENAI_LOCK:
+        llm = _GLOBAL_CHAT_OPENAI_INSTANCES.get(key)
+        if llm is None:
+            llm = ChatOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                temperature=temperature,
+                timeout=timeout,
+            )
+            _GLOBAL_CHAT_OPENAI_INSTANCES[key] = llm
+            _GLOBAL_CHAT_OPENAI_IDS.add(id(llm))
+        return llm
 
-    while True:
-        wait_seconds = 0.0
-        with _GLOBAL_LLM_RPM_LOCK:
-            now = time.monotonic()
-            is_my_turn = my_ticket == _GLOBAL_LLM_QUEUE_SERVING_TICKET
-            if is_my_turn and _GLOBAL_LLM_NEXT_ALLOWED_TS <= now:
-                _GLOBAL_LLM_NEXT_ALLOWED_TS = now + interval
-                _GLOBAL_LLM_QUEUE_SERVING_TICKET += 1
-                return
-            if is_my_turn:
-                wait_seconds = max(0.001, _GLOBAL_LLM_NEXT_ALLOWED_TS - now)
-            else:
-                wait_seconds = 0.05
-        await asyncio.sleep(wait_seconds)
+
+def is_shared_chat_openai_instance(llm: Any) -> bool:
+    """
+    Check whether the given llm object is managed by singleton factory.
+    """
+    with _GLOBAL_CHAT_OPENAI_LOCK:
+        return id(llm) in _GLOBAL_CHAT_OPENAI_IDS
+
+
+@asynccontextmanager
+async def global_llm_concurrency_guard(max_concurrent_calls: int):
+    """
+    Process-wide LLM concurrency guard.
+    Every request (including retries) must pass this guard.
+    """
+    sem = _get_global_llm_semaphore(max_concurrent_calls)
+    await asyncio.to_thread(sem.acquire)
+    try:
+        yield
+    finally:
+        sem.release()
 
 
 def extract_error_code(exc: Exception) -> Optional[str]:
@@ -145,7 +188,7 @@ class LangChainJsonLLMClient:
     - network-call retries
     - parse retries
     - exponential backoff
-    - optional process-wide RPM gate
+    - optional process-wide concurrency gate
     """
 
     def __init__(
@@ -158,7 +201,7 @@ class LangChainJsonLLMClient:
         retry_backoff_factor: float = 2.5,
         retry_max_delay: float = 120.0,
         hard_timeout: float = 180.0,
-        rpm_limit: Optional[int] = None,
+        llm_global_concurrency: Optional[int] = None,
         print_call_counter: bool = False,
         slow_call_threshold: float = 30.0,
         recycle_on_connection_error: bool = True,
@@ -177,8 +220,10 @@ class LangChainJsonLLMClient:
         self.recycle_on_connection_error = bool(recycle_on_connection_error)
         self.recycle_after_calls = max(0, int(recycle_after_calls))
         self.recycle_min_interval = max(0.0, float(recycle_min_interval))
-        self.rpm_limit = (
-            configure_global_llm_rpm(rpm_limit) if rpm_limit is not None else None
+        self.llm_global_concurrency = (
+            configure_global_llm_concurrency(llm_global_concurrency)
+            if llm_global_concurrency is not None
+            else None
         )
         self._local_call_count_lock = threading.Lock()
         self._local_call_count = 0
@@ -290,16 +335,24 @@ class LangChainJsonLLMClient:
         while True:
             try:
                 llm = self._bind_json_schema_llm(schema, schema_name)
-                if self.rpm_limit is not None:
-                    await acquire_global_llm_queue_slot(self.rpm_limit)
                 call_started = time.monotonic()
-                if self.hard_timeout > 0:
-                    response = await asyncio.wait_for(
-                        llm.ainvoke(lc_messages),
-                        timeout=self.hard_timeout,
-                    )
+                if self.llm_global_concurrency is not None:
+                    async with global_llm_concurrency_guard(self.llm_global_concurrency):
+                        if self.hard_timeout > 0:
+                            response = await asyncio.wait_for(
+                                llm.ainvoke(lc_messages),
+                                timeout=self.hard_timeout,
+                            )
+                        else:
+                            response = await llm.ainvoke(lc_messages)
                 else:
-                    response = await llm.ainvoke(lc_messages)
+                    if self.hard_timeout > 0:
+                        response = await asyncio.wait_for(
+                            llm.ainvoke(lc_messages),
+                            timeout=self.hard_timeout,
+                        )
+                    else:
+                        response = await llm.ainvoke(lc_messages)
                 if self.print_call_counter:
                     mark_global_llm_call_completed(schema_name)
                 call_elapsed = time.monotonic() - call_started

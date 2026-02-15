@@ -1,4 +1,4 @@
-"""
+﻿"""
 Batch runner for v2 relation extraction on brand markdown documents.
 
 Task strategy:
@@ -6,7 +6,7 @@ Task strategy:
       part_<start>_<end>_<doc_id>.md
   - Keep id-only markdown names by default.
   - Clean low-information markdown files by text threshold.
-  - Run document tasks sequentially; global LLM RPM cap throttles outgoing calls.
+  - Run document tasks sequentially; global LLM concurrency cap throttles outgoing calls.
 
 Outputs:
   results/<batch_name>/<brand>/<doc_key>/
@@ -21,17 +21,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import json
-import re
 import shutil
 import sys
 import threading
 import traceback
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -45,26 +42,14 @@ if sys.platform.startswith("win"):
         pass
 
 from LLMRelationExtracter_v2 import extract_relations_multistage  # noqa: E402
+from LLMRelationExtracter_v2.md_task_utils import (  # noqa: E402
+    MarkdownTask,
+    discover_tasks_for_brand_root,
+    prepare_task_input_dir,
+)
 from backend.settings import RELATION_EXTRACTOR_CONFIG  # noqa: E402
 
-_PART_STEM_RE = re.compile(
-    r"^part_(?P<start>\d+)_(?P<end>\d+)_(?P<doc_id>.+?)(?:_result)?$",
-    re.IGNORECASE,
-)
-_ID_ONLY_STEM_RE = re.compile(r"^[0-9a-z]{20,}$")
-_IMAGE_MD_RE = re.compile(r"!\[[^\]]*]\([^)]+\)")
-_MEANINGFUL_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
 _BATCH_ERROR_LOG_LOCK = threading.Lock()
-
-
-@dataclass(frozen=True)
-class Task:
-    brand: str
-    doc_key: str
-    raw_doc_id: str
-    kind: str
-    brand_dir: Path
-    md_files: Tuple[Path, ...]
 
 
 class JsonArrayWriter:
@@ -103,200 +88,15 @@ def _to_relative_display(path: Path) -> str:
         return str(path.resolve())
 
 
-def _sanitize_key(text: str) -> str:
-    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", (text or "").strip()).strip("_")
-    return cleaned or "doc"
-
-
-def _extract_part_doc_id(doc_tail: str) -> str:
-    """
-    Extract stable doc id from part stem tail.
-    Example:
-      CN119178214A_空调系统... -> CN119178214A
-      WO2024187755A1_除霜控制_ -> WO2024187755A1
-      085134vs3s5ekwzj3jq51m -> 085134vs3s5ekwzj3jq51m
-    """
-    text = (doc_tail or "").strip("_")
-    if not text:
-        return doc_tail
-    prefix_match = re.match(r"^[0-9A-Za-z-]+", text)
-    if prefix_match:
-        return prefix_match.group(0)
-    return text
-
-
-def _ensure_unique_key(base_key: str, used_keys: set[str]) -> str:
-    if base_key not in used_keys:
-        used_keys.add(base_key)
-        return base_key
-    seq = 2
-    while True:
-        candidate = f"{base_key}__{seq}"
-        if candidate not in used_keys:
-            used_keys.add(candidate)
-            return candidate
-        seq += 1
-
-
-def _discover_tasks(
-    input_root: Path,
-    include_brands: Optional[Iterable[str]],
-    exclude_brands: Iterable[str],
-    drop_id_only: bool,
-    min_text_chars: int,
-    max_docs: int,
-) -> tuple[List[Task], Dict, List[Dict]]:
-    include_set = {name.strip() for name in (include_brands or []) if name.strip()}
-    use_include_filter = bool(include_set)
-    exclude_set = {name.strip() for name in exclude_brands if str(name).strip()}
-
-    tasks: List[Task] = []
-    cleaned_samples: List[Dict] = []
-    stats: Dict = {
-        "md_files_total": 0,
-        "md_files_cleaned_id_only": 0,
-        "md_files_cleaned_low_text": 0,
-        "tasks_part_group": 0,
-        "tasks_single_file": 0,
-        "by_brand": {},
-    }
-
-    for brand_dir in sorted(path for path in input_root.iterdir() if path.is_dir()):
-        brand = brand_dir.name
-        if use_include_filter and brand not in include_set:
-            continue
-        if brand in exclude_set:
-            continue
-        if brand.startswith("."):
-            continue
-
-        md_files = sorted(path.resolve() for path in brand_dir.rglob("*.md") if path.is_file())
-        if not md_files:
-            continue
-
-        brand_stats = {
-            "md_files_total": len(md_files),
-            "md_files_cleaned_id_only": 0,
-            "md_files_cleaned_low_text": 0,
-            "tasks_part_group": 0,
-            "tasks_single_file": 0,
-        }
-        stats["by_brand"][brand] = brand_stats
-        stats["md_files_total"] += len(md_files)
-
-        part_groups: Dict[str, List[tuple[int, int, Path]]] = {}
-        single_files: List[Path] = []
-        used_keys: set[str] = set()
-
-        for md_path in md_files:
-            stem = md_path.stem
-            part_match = _PART_STEM_RE.match(stem)
-            if part_match:
-                start = int(part_match.group("start"))
-                end = int(part_match.group("end"))
-                tail = (part_match.group("doc_id") or "").strip("_") or stem
-                doc_id = _extract_part_doc_id(tail)
-                part_groups.setdefault(doc_id, []).append((start, end, md_path))
-                continue
-
-            low_text = False
-            if min_text_chars > 0:
-                try:
-                    raw_text = md_path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    raw_text = md_path.read_text(encoding="utf-8-sig")
-                except Exception:
-                    raw_text = ""
-
-                text_no_img = _IMAGE_MD_RE.sub(" ", raw_text or "")
-                meaningful_chars = len(_MEANINGFUL_CHAR_RE.findall(text_no_img))
-                if meaningful_chars < min_text_chars:
-                    low_text = True
-
-            if low_text:
-                brand_stats["md_files_cleaned_low_text"] += 1
-                stats["md_files_cleaned_low_text"] += 1
-                if len(cleaned_samples) < 200:
-                    cleaned_samples.append(
-                        {
-                            "brand": brand,
-                            "md_path": _to_relative_display(md_path),
-                            "reason": f"low_text_content(<{min_text_chars})",
-                        }
-                    )
-                continue
-
-            if drop_id_only and _ID_ONLY_STEM_RE.fullmatch(stem):
-                brand_stats["md_files_cleaned_id_only"] += 1
-                stats["md_files_cleaned_id_only"] += 1
-                if len(cleaned_samples) < 200:
-                    cleaned_samples.append(
-                        {
-                            "brand": brand,
-                            "md_path": _to_relative_display(md_path),
-                            "reason": "id_only_name",
-                        }
-                    )
-                continue
-
-            single_files.append(md_path)
-
-        for doc_id in sorted(part_groups.keys(), key=lambda x: x.lower()):
-            ordered_files = tuple(
-                path
-                for _, _, path in sorted(
-                    part_groups[doc_id],
-                    key=lambda item: (item[0], item[1], str(item[2])),
-                )
-            )
-            base_key = _sanitize_key(doc_id)
-            doc_key = _ensure_unique_key(base_key, used_keys)
-            tasks.append(
-                Task(
-                    brand=brand,
-                    doc_key=doc_key,
-                    raw_doc_id=doc_id,
-                    kind="part_group",
-                    brand_dir=brand_dir.resolve(),
-                    md_files=ordered_files,
-                )
-            )
-            brand_stats["tasks_part_group"] += 1
-            stats["tasks_part_group"] += 1
-
-        for md_path in sorted(single_files, key=lambda path: str(path)):
-            relative_no_suffix = md_path.relative_to(brand_dir).with_suffix("")
-            raw_key = "__".join(relative_no_suffix.parts)
-            base_key = _sanitize_key(raw_key)
-            doc_key = _ensure_unique_key(base_key, used_keys)
-            tasks.append(
-                Task(
-                    brand=brand,
-                    doc_key=doc_key,
-                    raw_doc_id=md_path.stem,
-                    kind="single_file",
-                    brand_dir=brand_dir.resolve(),
-                    md_files=(md_path,),
-                )
-            )
-            brand_stats["tasks_single_file"] += 1
-            stats["tasks_single_file"] += 1
-
-    tasks = sorted(tasks, key=lambda item: (item.brand.lower(), item.doc_key.lower()))
-    if max_docs > 0:
-        tasks = tasks[:max_docs]
-    return tasks, stats, cleaned_samples
-
-
 def _append_batch_error_record(
     batch_error_log: Path,
-    task: Task,
+    task: MarkdownTask,
     payload: Dict,
 ) -> None:
     batch_error_log.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "brand": task.brand,
+        "brand": task.brand or "unknown_brand",
         "doc_key": task.doc_key,
         "raw_doc_id": task.raw_doc_id,
         "kind": task.kind,
@@ -311,7 +111,7 @@ def _append_batch_error_record(
 def _flush_task_error_log_to_batch(
     task_error_log: Path,
     batch_error_log: Path,
-    task: Task,
+    task: MarkdownTask,
 ) -> int:
     if not task_error_log.exists():
         return 0
@@ -394,54 +194,29 @@ def _error_log_contains_connection_error(error_log_path: Path) -> bool:
     return "connection error." in text.lower()
 
 
-def _link_or_copy_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        dst.unlink()
-    try:
-        os.link(str(src), str(dst))
-    except Exception:
-        shutil.copy2(src, dst)
-
-
-def _prepare_task_input_dir(task: Task, batch_root: Path) -> Path:
-    """
-    Build a task-local markdown directory so extractor runs directory mode.
-    """
-    task_input_dir = batch_root / "_task_inputs" / task.brand / task.doc_key
-    if task_input_dir.exists():
-        shutil.rmtree(task_input_dir)
-    task_input_dir.mkdir(parents=True, exist_ok=True)
-
-    for md_path in task.md_files:
-        relative = md_path.relative_to(task.brand_dir)
-        dst = task_input_dir / relative
-        _link_or_copy_file(md_path, dst)
-    return task_input_dir
-
-
 def _run_one_task(
-    task: Task,
+    task: MarkdownTask,
     *,
     batch_root: Path,
     batch_error_log: Path,
     skip_existing: bool,
     keep_task_inputs: bool,
     max_concurrent: int,
-    llm_global_rpm: int,
+    llm_global_concurrency: int,
     window_size: int,
     use_sliding_window: bool,
     max_retries: int,
     llm_call_hard_timeout: float,
 ) -> Dict:
-    doc_output_dir = batch_root / task.brand / task.doc_key
+    brand = task.brand or "unknown_brand"
+    doc_output_dir = batch_root / brand / task.doc_key
     doc_output_dir.mkdir(parents=True, exist_ok=True)
     legacy_doc_error_log = doc_output_dir / "errors.log"
     if legacy_doc_error_log.exists():
         legacy_doc_error_log.unlink()
 
     relation_output = doc_output_dir / "relation_results.json"
-    task_error_log = batch_root / "_task_error_tmp" / task.brand / f"{task.doc_key}.jsonl"
+    task_error_log = batch_root / "_task_error_tmp" / brand / f"{task.doc_key}.jsonl"
     task_error_log.parent.mkdir(parents=True, exist_ok=True)
     if task_error_log.exists():
         task_error_log.unlink()
@@ -463,13 +238,17 @@ def _run_one_task(
                 "error": None,
             }
 
-        task_input_dir = _prepare_task_input_dir(task, batch_root)
+        task_input_dir = prepare_task_input_dir(
+            task,
+            output_root=batch_root,
+            scope_parts=(brand,),
+        )
         extract_relations_multistage(
             csv_path=task_input_dir,
             output_path=relation_output,
             error_log_path=task_error_log,
             max_concurrent=max_concurrent,
-            llm_global_concurrency=llm_global_rpm,
+            llm_global_concurrency=llm_global_concurrency,
             window_size=window_size,
             use_sliding_window=use_sliding_window,
             show_progress=False,
@@ -581,7 +360,7 @@ def _parse_args() -> argparse.Namespace:
         "--llm-global-concurrency",
         type=int,
         default=10,
-        help="Global LLM request cap in RPM (requests per minute) shared by all tasks.",
+        help="Global in-flight LLM call cap shared by all tasks.",
     )
     parser.add_argument(
         "--max-concurrent",
@@ -663,7 +442,7 @@ def main() -> None:
     batch_root = results_root / args.batch_name
     batch_root.mkdir(parents=True, exist_ok=True)
 
-    tasks, discovery_stats, cleaned_samples = _discover_tasks(
+    tasks, discovery_stats, cleaned_samples = discover_tasks_for_brand_root(
         input_root=input_root,
         include_brands=args.include_brands,
         exclude_brands=args.exclude_brands or [],
@@ -671,10 +450,17 @@ def main() -> None:
         min_text_chars=max(0, int(args.min_text_chars)),
         max_docs=max(0, int(args.max_docs)),
     )
+    cleaned_samples = [
+        {
+            **item,
+            "md_path": _to_relative_display(Path(str(item.get("md_path", "")))),
+        }
+        for item in cleaned_samples
+    ]
     if not tasks:
         raise FileNotFoundError(f"No markdown docs found under: {input_root}")
 
-    llm_global_rpm = max(1, int(args.llm_global_concurrency))
+    llm_global_concurrency = max(1, int(args.llm_global_concurrency))
     default_max_retries = max(0, int(RELATION_EXTRACTOR_CONFIG.get("max_retries", 8)))
     default_llm_call_hard_timeout = float(RELATION_EXTRACTOR_CONFIG.get("llm_call_hard_timeout", 180.0))
     effective_max_retries = (
@@ -695,7 +481,7 @@ def main() -> None:
         "[batch-md] Options: "
         "scheduler=sequential, "
         f"max_concurrent={args.max_concurrent}, "
-        f"llm_global_rpm={llm_global_rpm}, "
+        f"llm_global_concurrency={llm_global_concurrency}, "
         f"window_size={args.window_size}, sliding_window={not args.no_sliding_window}, "
         f"skip_existing={args.skip_existing}, drop_id_only={args.drop_id_only}, "
         f"min_text_chars={args.min_text_chars}, "
@@ -708,11 +494,8 @@ def main() -> None:
     if int(args.doc_concurrency) != 0:
         print("[batch-md] Note: --doc-concurrency is deprecated and ignored (sequential scheduler).")
     print(
-        "[batch-md] Process-wide LLM RPM cap: "
-        f"{llm_global_rpm} req/min"
-    )
-    print(
-        f"[batch-md] LLM pacing: one request about every {60.0 / llm_global_rpm:.2f}s"
+        "[batch-md] Process-wide LLM concurrency cap: "
+        f"{llm_global_concurrency}"
     )
     print("[batch-md] Console will print cumulative LLM call completions.")
     print(
@@ -727,13 +510,14 @@ def main() -> None:
     if args.dry_run:
         preview = tasks[:20]
         for idx, task in enumerate(preview, start=1):
+            brand = task.brand or "unknown_brand"
             source_preview = ", ".join(
                 _to_relative_display(path) for path in list(task.md_files)[:2]
             )
             if len(task.md_files) > 2:
                 source_preview += f", ...(+{len(task.md_files) - 2})"
             print(
-                f"  {idx:>4}. brand={task.brand}, doc={task.doc_key}, kind={task.kind}, "
+                f"  {idx:>4}. brand={brand}, doc={task.doc_key}, kind={task.kind}, "
                 f"parts={len(task.md_files)}, src={source_preview}"
             )
         if len(tasks) > len(preview):
@@ -769,10 +553,12 @@ def main() -> None:
     brand_skip_count: Dict[str, int] = {}
 
     for task in tasks:
-        brand_doc_count[task.brand] = brand_doc_count.get(task.brand, 0) + 1
+        brand = task.brand or "unknown_brand"
+        brand_doc_count[brand] = brand_doc_count.get(brand, 0) + 1
 
     with JsonArrayWriter(flat_output) as flat_writer, JsonArrayWriter(with_source_output) as src_writer:
         for completed, task in enumerate(tasks, start=1):
+            brand = task.brand or "unknown_brand"
             result = _run_one_task(
                 task,
                 batch_root=batch_root,
@@ -780,7 +566,7 @@ def main() -> None:
                 skip_existing=bool(args.skip_existing),
                 keep_task_inputs=bool(args.keep_task_inputs),
                 max_concurrent=safe_max_concurrent,
-                llm_global_rpm=llm_global_rpm,
+                llm_global_concurrency=llm_global_concurrency,
                 window_size=int(args.window_size),
                 use_sliding_window=not args.no_sliding_window,
                 max_retries=effective_max_retries,
@@ -792,10 +578,10 @@ def main() -> None:
             if status == "failed":
                 docs_failed += 1
                 docs_executed += 1
-                brand_fail_count[task.brand] = brand_fail_count.get(task.brand, 0) + 1
+                brand_fail_count[brand] = brand_fail_count.get(brand, 0) + 1
                 fail_items.append(
                     {
-                        "brand": task.brand,
+                        "brand": brand,
                         "doc_key": task.doc_key,
                         "raw_doc_id": task.raw_doc_id,
                         "kind": task.kind,
@@ -808,20 +594,20 @@ def main() -> None:
                 )
                 print(
                     f"[batch-md] ({completed}/{len(tasks)}) "
-                    f"{task.brand}/{task.doc_key} failed: {result['error']}"
+                    f"{brand}/{task.doc_key} failed: {result['error']}"
                 )
                 continue
 
             if status == "skipped":
                 docs_skipped += 1
-                brand_skip_count[task.brand] = brand_skip_count.get(task.brand, 0) + 1
+                brand_skip_count[brand] = brand_skip_count.get(brand, 0) + 1
             else:
                 docs_executed += 1
 
             docs_ok += 1
             products_total += len(products)
-            brand_product_count[task.brand] = (
-                brand_product_count.get(task.brand, 0) + len(products)
+            brand_product_count[brand] = (
+                brand_product_count.get(brand, 0) + len(products)
             )
 
             source_md_paths = [_to_relative_display(path) for path in task.md_files]
@@ -829,7 +615,7 @@ def main() -> None:
                 flat_writer.write(product)
                 src_writer.write(
                     {
-                        "source_brand": task.brand,
+                        "source_brand": brand,
                         "source_doc_key": task.doc_key,
                         "source_doc_id": task.raw_doc_id,
                         "source_kind": task.kind,
@@ -839,7 +625,7 @@ def main() -> None:
                 )
 
             print(
-                f"[batch-md] ({completed}/{len(tasks)}) {task.brand}/{task.doc_key} "
+                f"[batch-md] ({completed}/{len(tasks)}) {brand}/{task.doc_key} "
                 f"{status}: products_raw={len(products)}"
             )
 
@@ -873,7 +659,7 @@ def main() -> None:
             "scheduler_mode": "sequential",
             "threadpool_workers": 0,
             "max_concurrent": safe_max_concurrent,
-            "llm_global_rpm": llm_global_rpm,
+            "llm_global_concurrency": llm_global_concurrency,
             "max_retries": effective_max_retries,
             "retry_delay": float(RELATION_EXTRACTOR_CONFIG.get("retry_delay", 2.0)),
             "retry_backoff_factor": float(RELATION_EXTRACTOR_CONFIG.get("retry_backoff_factor", 2.5)),

@@ -8,10 +8,11 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from langchain_openai import ChatOpenAI
-
 from backend.settings import RELATION_EXTRACTOR_CONFIG
-from LLMRelationExtracter.llm_client import LangChainJsonLLMClient
+from LLMRelationExtracter.llm_client import (
+    LangChainJsonLLMClient,
+    get_shared_chat_openai,
+)
 
 # JSON schema for strict response validation (simplified, aligns with target table)
 RELATION_SCHEMA = {
@@ -78,7 +79,7 @@ RELATION_SCHEMA = {
 class RelationExtractor:
     def __init__(self) -> None:
         self.logger = self._setup_logging()
-        self.llm = ChatOpenAI(
+        self.llm = get_shared_chat_openai(
             api_key=RELATION_EXTRACTOR_CONFIG["api_key"],
             base_url=RELATION_EXTRACTOR_CONFIG["base_url"],
             model=RELATION_EXTRACTOR_CONFIG["model"],
@@ -96,11 +97,8 @@ class RelationExtractor:
             ),
             retry_max_delay=float(RELATION_EXTRACTOR_CONFIG.get("retry_max_delay", 120.0)),
             hard_timeout=float(RELATION_EXTRACTOR_CONFIG.get("llm_call_hard_timeout", 180.0)),
-            rpm_limit=int(
-                RELATION_EXTRACTOR_CONFIG.get(
-                    "llm_global_rpm",
-                    RELATION_EXTRACTOR_CONFIG.get("llm_global_concurrency", 10),
-                )
+            llm_global_concurrency=int(
+                RELATION_EXTRACTOR_CONFIG.get("llm_global_concurrency", 10)
             ),
             print_call_counter=False,
             recycle_on_connection_error=bool(

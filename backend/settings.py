@@ -149,9 +149,10 @@ RELATION_EXTRACTOR_CONFIG = {
     # Concurrency control
     "global_concurrency": int(os.getenv("GLOBAL_CONCURRENCY", os.getenv("MAX_CONCURRENT", "100"))),
     "max_concurrent": int(os.getenv("MAX_CONCURRENT", "100")),
-    # Backward-compatible name: llm_global_concurrency now means global RPM cap.
-    "llm_global_concurrency": int(os.getenv("LLM_GLOBAL_RPM", os.getenv("LLM_GLOBAL_CONCURRENCY", 10))),
-    "llm_global_rpm": int(os.getenv("LLM_GLOBAL_RPM", os.getenv("LLM_GLOBAL_CONCURRENCY", 10))),
+    # Process-wide in-flight LLM call cap shared by all request paths.
+    "llm_global_concurrency": int(
+        os.getenv("LLM_GLOBAL_CONCURRENCY", 10)
+    ),
     "timeout": int(os.getenv("REQUEST_TIMEOUT", 3000)),  # ??????(?),??3??
     # Hard timeout guard for each single llm.ainvoke call (seconds).
     "llm_call_hard_timeout": float(os.getenv("LLM_CALL_HARD_TIMEOUT", 180.0)),
