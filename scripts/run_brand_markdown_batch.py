@@ -6,7 +6,7 @@ Task strategy:
       part_<start>_<end>_<doc_id>.md
   - Keep id-only markdown names by default.
   - Clean low-information markdown files by text threshold.
-  - Run document tasks sequentially; global LLM concurrency cap throttles outgoing calls.
+  - Run document tasks sequentially; request pacing is controlled by global RPM.
 
 Outputs:
   results/<batch_name>/<brand>/<doc_key>/
@@ -498,7 +498,7 @@ def main() -> None:
         "[batch-md] Options: "
         "scheduler=sequential, "
         f"max_concurrent={safe_max_concurrent}, "
-        f"llm_global_concurrency={llm_global_concurrency}, "
+        f"llm_global_concurrency(arg)={llm_global_concurrency}, "
         f"llm_global_rpm={effective_llm_global_rpm}, "
         f"window_size={args.window_size}, sliding_window={not args.no_sliding_window}, "
         f"skip_existing={args.skip_existing}, drop_id_only={args.drop_id_only}, "
@@ -511,6 +511,10 @@ def main() -> None:
         print("[batch-md] Note: --show-progress is deprecated and ignored.")
     if int(args.doc_concurrency) != 0:
         print("[batch-md] Note: --doc-concurrency is deprecated and ignored (sequential scheduler).")
+    print(
+        "[batch-md] Note: --llm-global-concurrency is compatibility-only; "
+        "semaphore concurrency limiter is disabled."
+    )
     print(
         "[batch-md] Process-wide LLM pacing: "
         f"rpm={effective_llm_global_rpm} (uniformly distributed)"

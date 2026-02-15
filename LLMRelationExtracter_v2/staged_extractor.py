@@ -32,10 +32,8 @@ from LLMRelationExtracter.md_processor import (
 )
 from LLMRelationExtracter.llm_client import (
     build_json_llm_client_from_config,
-    configure_global_llm_concurrency,
     extract_error_code,
     extract_error_diagnostics,
-    get_global_llm_concurrency,
     get_shared_chat_openai,
     is_shared_chat_openai_instance,
 )
@@ -545,19 +543,6 @@ def _model_node_key(brand: str, series: str, model_name: str) -> str:
 @lru_cache(maxsize=2)
 def _get_embedder(model_name: str, device: str):
     return SentenceTransformer(model_name, device=device)
-
-
-def _get_concurrency(config: Dict, key: str, default: int) -> int:
-    """
-    Read concurrency for stage-internal fan-out workers.
-    """
-    if key in config and config[key] is not None:
-        return max(1, int(config[key]))
-    if "max_concurrent" in config and config["max_concurrent"] is not None:
-        return max(1, int(config["max_concurrent"]))
-    if "global_concurrency" in config and config["global_concurrency"] is not None:
-        return max(1, int(config["global_concurrency"]))
-    return int(default)
 
 
 def _embed_texts(texts: List[str], model_name: str, device: str = "cpu") -> np.ndarray:
@@ -1273,27 +1258,17 @@ class StagedRelationExtractor:
             ),
             http_keepalive_expiry=self.config.get("llm_http_keepalive_expiry", 30.0),
         )
-        configured_llm_global_concurrency = int(
-            self.config.get("llm_global_concurrency", 10)
-        )
-        self.llm_global_concurrency = configure_global_llm_concurrency(
-            configured_llm_global_concurrency
-        )
-        effective_global_concurrency = get_global_llm_concurrency()
-        if (
-            effective_global_concurrency is not None
-            and effective_global_concurrency != configured_llm_global_concurrency
-        ):
+        configured_llm_global_concurrency = int(self.config.get("llm_global_concurrency", 10))
+        if configured_llm_global_concurrency > 0:
             self.logger.info(
-                "Reuse existing global LLM concurrency cap=%s (requested=%s)",
-                effective_global_concurrency,
+                "llm_global_concurrency=%s is compatibility-only; semaphore cap is disabled",
                 configured_llm_global_concurrency,
             )
         self.llm_client = build_json_llm_client_from_config(
             self.lc_llm,
             config=self.config,
             logger=self.logger,
-            llm_global_concurrency=self.llm_global_concurrency,
+            llm_global_concurrency=None,
             print_call_counter=True,
             slow_call_threshold=30.0,
         )
@@ -2717,18 +2692,12 @@ class StagedRelationExtractor:
         for brand_item in brands:
             brand_name = brand_item["name"]
             raw_series_list: List[Dict] = []
-            page_limit = _get_concurrency(self.config, "series_page_concurrency", 12)
-            page_sem = asyncio.Semaphore(page_limit)
 
             async def _run_page(text: str, meta: Dict) -> List[Dict]:
                 return await self._extract_series_single(brand_name, text, meta, error_log)
 
-            async def _run_page_bounded(text: str, meta: Dict) -> List[Dict]:
-                async with page_sem:
-                    return await _run_page(text, meta)
-
             page_tasks = [
-                asyncio.create_task(_run_page_bounded(text, meta))
+                asyncio.create_task(_run_page(text, meta))
                 for text, meta in pages
             ]
             if page_tasks:
@@ -2767,21 +2736,13 @@ class StagedRelationExtractor:
                     clusters = self._cluster_pages_for_brands(pages, cluster_size)
 
             if clusters:
-                cluster_limit = _get_concurrency(
-                    self.config,
-                    "series_cluster_concurrency",
-                    6,
-                )
-                cluster_sem = asyncio.Semaphore(cluster_limit)
-
                 async def _run_cluster(cluster_text: str, page_labels: List) -> List[Dict]:
-                    async with cluster_sem:
-                        return await self._extract_series_cluster(
-                            brand_name,
-                            cluster_text,
-                            page_labels,
-                            error_log,
-                        )
+                    return await self._extract_series_cluster(
+                        brand_name,
+                        cluster_text,
+                        page_labels,
+                        error_log,
+                    )
 
                 cluster_tasks = [
                     asyncio.create_task(_run_cluster(cluster_text, page_labels))
@@ -2876,7 +2837,6 @@ class StagedRelationExtractor:
         try:
             chunks = _split_text(text_block, self.config.get("max_chars_per_call", 8000))
             model_items: List[Dict] = []
-            chunk_sem = asyncio.Semaphore(_get_concurrency(self.config, "model_chunk_concurrency", 8))
             if getattr(self, "_show_progress", False):
                 pair_label = f"{(brand or 'unknown')[:10]}/{(series or 'all')[:12]}"
                 chunk_pbar = tqdm(
@@ -2888,23 +2848,22 @@ class StagedRelationExtractor:
 
             async def _run_chunk(chunk_idx: int, chunk_text: str) -> Tuple[str, List[Dict]]:
                 try:
-                    async with chunk_sem:
-                        payload = await self._acall(
-                            build_model_messages(
-                                brand,
-                                series,
-                                chunk_text,
-                                context_pages=context_pages,
-                            ),
-                            MODEL_SCHEMA,
-                            "model_schema",
-                            {
-                                "brand": brand,
-                                "series": series,
-                                "chunk_index": chunk_idx + 1,
-                                "chunk_total": len(chunks),
-                            },
-                        )
+                    payload = await self._acall(
+                        build_model_messages(
+                            brand,
+                            series,
+                            chunk_text,
+                            context_pages=context_pages,
+                        ),
+                        MODEL_SCHEMA,
+                        "model_schema",
+                        {
+                            "brand": brand,
+                            "series": series,
+                            "chunk_index": chunk_idx + 1,
+                            "chunk_total": len(chunks),
+                        },
+                    )
                     return chunk_text, payload.get("models", [])
                 except Exception as exc:  # noqa: BLE001
                     _append_error(
@@ -3369,9 +3328,7 @@ class StagedRelationExtractor:
         if getattr(self, "_show_progress", False):
             pbar = tqdm(total=len(pairs), desc="Stage C: models", unit="pair")
 
-        pair_limit = max(1, _get_concurrency(self.config, "model_pair_concurrency", 6))
-        pair_sem = asyncio.Semaphore(pair_limit)
-        self.logger.info("Stage C model pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
+        self.logger.info("Stage C model pair scheduling=unbounded, pairs=%s", len(pairs))
 
         async def _run_pair(
             brand: str,
@@ -3449,16 +3406,8 @@ class StagedRelationExtractor:
                 )
                 return _pair_key(brand, series_name), []
 
-        async def _run_pair_bounded(
-            brand: str,
-            series_name: str,
-            series_pages: List,
-        ) -> Tuple[str, List[Dict]]:
-            async with pair_sem:
-                return await _run_pair(brand, series_name, series_pages)
-
         tasks = [
-            asyncio.create_task(_run_pair_bounded(brand, series_name, series_pages))
+            asyncio.create_task(_run_pair(brand, series_name, series_pages))
             for brand, series_name, series_pages in pairs
         ]
         for task in asyncio.as_completed(tasks):
@@ -3529,7 +3478,6 @@ class StagedRelationExtractor:
         try:
             chunks = _split_text(text_block, self.config.get("max_chars_per_call", 8000))
             products = []
-            chunk_sem = asyncio.Semaphore(_get_concurrency(self.config, "product_chunk_concurrency", 8))
             if getattr(self, "_show_progress", False):
                 pair_label = f"{(brand or 'unknown')[:10]}/{(series or 'all')[:12]}"
                 if target_model:
@@ -3543,24 +3491,23 @@ class StagedRelationExtractor:
 
             async def _run_chunk(chunk_idx: int, chunk_text: str) -> Tuple[str, List[Dict]]:
                 try:
-                    async with chunk_sem:
-                        payload = await self._acall(
-                            build_product_messages(
-                                brand,
-                                series,
-                                chunk_text,
-                                known_models=known_models,
-                                target_model=target_model,
-                            ),
-                            PRODUCT_SCHEMA,
-                            "product_schema",
-                            {
-                                "brand": brand,
-                                "series": series,
-                                "chunk_index": chunk_idx + 1,
-                                "chunk_total": len(chunks),
-                            },
-                        )
+                    payload = await self._acall(
+                        build_product_messages(
+                            brand,
+                            series,
+                            chunk_text,
+                            known_models=known_models,
+                            target_model=target_model,
+                        ),
+                        PRODUCT_SCHEMA,
+                        "product_schema",
+                        {
+                            "brand": brand,
+                            "series": series,
+                            "chunk_index": chunk_idx + 1,
+                            "chunk_total": len(chunks),
+                        },
+                    )
                     return chunk_text, payload.get("results", [])
                 except Exception as exc:  # noqa: BLE001
                     _append_error(
@@ -3648,9 +3595,7 @@ class StagedRelationExtractor:
         if getattr(self, "_show_progress", False):
             pbar = tqdm(total=len(pairs), desc="Stage D: products", unit="pair")
 
-        pair_limit = max(1, _get_concurrency(self.config, "product_pair_concurrency", 6))
-        pair_sem = asyncio.Semaphore(pair_limit)
-        self.logger.info("Stage D pair concurrency=%s, pairs=%s", pair_limit, len(pairs))
+        self.logger.info("Stage D pair scheduling=unbounded, pairs=%s", len(pairs))
 
         async def _run_pair(
             pair_index: int,
@@ -3686,52 +3631,47 @@ class StagedRelationExtractor:
                         [p for p in model_to_pages[model_name] if p is not None and str(p) != ""]
                     )
 
-                model_sem = asyncio.Semaphore(
-                    max(1, _get_concurrency(self.config, "product_model_concurrency", 6))
-                )
-
                 async def _run_model(model_name: str) -> List[Dict]:
-                    async with model_sem:
-                        model_pages = model_to_pages.get(model_name, [])
-                        if not model_pages:
-                            return []
-                        model_relevant_pages = _select_pages_by_numbers_with_following(
-                            pages,
-                            model_pages,
-                            follow_after=follow_after,
-                        )
-                        if not model_relevant_pages:
-                            return []
-                        text_block = _combine_pages(
-                            model_relevant_pages,
-                            self.config,
-                            target_model=model_name,
-                        )
-                        page_refs = [meta.get("page") for _, meta in model_relevant_pages]
-                        extracted = await self._extract_products_for_pair(
-                            brand,
-                            series_name,
-                            text_block,
-                            page_refs,
-                            [model_name],
-                            error_log,
-                            target_model=model_name,
-                        )
-                        processed_model = list(extracted)
-                        if processed_model:
-                            processed_model = await self._review_products_llm(
-                                brand,
-                                series_name,
-                                processed_model,
-                                error_log,
-                            )
-                        processed_model = self._bind_products_to_known_models(
+                    model_pages = model_to_pages.get(model_name, [])
+                    if not model_pages:
+                        return []
+                    model_relevant_pages = _select_pages_by_numbers_with_following(
+                        pages,
+                        model_pages,
+                        follow_after=follow_after,
+                    )
+                    if not model_relevant_pages:
+                        return []
+                    text_block = _combine_pages(
+                        model_relevant_pages,
+                        self.config,
+                        target_model=model_name,
+                    )
+                    page_refs = [meta.get("page") for _, meta in model_relevant_pages]
+                    extracted = await self._extract_products_for_pair(
+                        brand,
+                        series_name,
+                        text_block,
+                        page_refs,
+                        [model_name],
+                        error_log,
+                        target_model=model_name,
+                    )
+                    processed_model = list(extracted)
+                    if processed_model:
+                        processed_model = await self._review_products_llm(
                             brand,
                             series_name,
                             processed_model,
-                            [model_name],
+                            error_log,
                         )
-                        return _deduplicate_products_by_model(processed_model, self.config)
+                    processed_model = self._bind_products_to_known_models(
+                        brand,
+                        series_name,
+                        processed_model,
+                        [model_name],
+                    )
+                    return _deduplicate_products_by_model(processed_model, self.config)
 
                 model_tasks = [asyncio.create_task(_run_model(model_name)) for model_name in known_models]
                 model_products: List[Dict] = []
@@ -3760,17 +3700,8 @@ class StagedRelationExtractor:
                 )
                 return pair_index, []
 
-        async def _run_pair_bounded(
-            pair_index: int,
-            brand: str,
-            series_name: str,
-            series_pages: List,
-        ) -> Tuple[int, List[Dict]]:
-            async with pair_sem:
-                return await _run_pair(pair_index, brand, series_name, series_pages)
-
         tasks = [
-            asyncio.create_task(_run_pair_bounded(pair_index, brand, series_name, series_pages))
+            asyncio.create_task(_run_pair(pair_index, brand, series_name, series_pages))
             for pair_index, (brand, series_name, series_pages) in enumerate(pairs)
         ]
 

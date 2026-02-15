@@ -2,7 +2,7 @@
 Shared LangChain LLM caller utilities for relation extraction.
 
 This module centralizes:
-1) Process-wide LLM concurrency control for outbound requests.
+1) Process-wide LLM RPM pacing for outbound requests.
 2) Unified retry/backoff behavior for network and parse failures.
 3) Strict JSON-schema response handling for ChatOpenAI calls.
 """
@@ -28,16 +28,12 @@ try:
 except Exception:  # noqa: BLE001
     httpx = None
 
-_GLOBAL_LLM_CONCURRENCY_LOCK = threading.Lock()
-_GLOBAL_LLM_CONCURRENCY_LIMIT: Optional[int] = None
-_GLOBAL_LLM_LOOP_SEMAPHORES: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = (
-    weakref.WeakKeyDictionary()
-)
 _GLOBAL_LLM_RPM_LOCK = threading.Lock()
 _GLOBAL_LLM_RPM_LIMIT: Optional[float] = None
 _GLOBAL_LLM_LOOP_RPM_LIMITERS: "weakref.WeakKeyDictionary[Any, _LoopRpmLimiter]"  # type: ignore[name-defined]
 _GLOBAL_LLM_CALL_COUNT_LOCK = threading.Lock()
 _GLOBAL_LLM_CALL_COUNT = 0
+_GLOBAL_LLM_CALL_START_COUNT = 0
 _GLOBAL_CHAT_OPENAI_LOCK = threading.Lock()
 _GLOBAL_CHAT_OPENAI_INSTANCES: Dict[tuple, Any] = {}
 _GLOBAL_CHAT_OPENAI_IDS: set[int] = set()
@@ -46,13 +42,14 @@ _GLOBAL_JSON_LLM_CLIENT_LOCK = threading.Lock()
 _GLOBAL_JSON_LLM_CLIENTS: Dict[tuple, "LangChainJsonLLMClient"] = {}
 _GLOBAL_HTTPX_WARNING_PRINTED = False
 _GLOBAL_RETRY_LOG_LOCK = threading.Lock()
+_GLOBAL_CONCURRENCY_DEPRECATION_PRINTED = False
 
 
 class _LoopRpmLimiter:
     """
     Per-event-loop paced dispatcher.
-    It serializes requests and distributes starts evenly by fixed interval.
-    When upstream has no pending callers, pacing is paused until demand resumes.
+    It distributes request starts evenly by fixed interval.
+    It does NOT cap in-flight concurrency.
     """
 
     def __init__(self, rpm: float) -> None:
@@ -62,8 +59,7 @@ class _LoopRpmLimiter:
         self._next_allowed = 0.0
 
     async def acquire_slot(self) -> None:
-        await self._lock.acquire()
-        try:
+        async with self._lock:
             now = time.monotonic()
             wait_seconds = self._next_allowed - now
             if wait_seconds > 0:
@@ -71,13 +67,6 @@ class _LoopRpmLimiter:
             current = time.monotonic()
             base = max(current, self._next_allowed)
             self._next_allowed = base + self.interval
-        except BaseException:
-            self._lock.release()
-            raise
-
-    def release_slot(self) -> None:
-        if self._lock.locked():
-            self._lock.release()
 
 
 _GLOBAL_LLM_LOOP_RPM_LIMITERS = weakref.WeakKeyDictionary()
@@ -85,32 +74,22 @@ _GLOBAL_LLM_LOOP_RPM_LIMITERS = weakref.WeakKeyDictionary()
 
 def configure_global_llm_concurrency(max_concurrent_calls: int) -> int:
     """
-    Configure process-wide global LLM call concurrency.
-    Keep the first initialized limit for process consistency.
+    Deprecated compatibility shim.
+    Global semaphore-based concurrency limiting has been removed.
     """
-    global _GLOBAL_LLM_CONCURRENCY_LIMIT
+    global _GLOBAL_CONCURRENCY_DEPRECATION_PRINTED
     safe_limit = max(1, int(max_concurrent_calls))
-    with _GLOBAL_LLM_CONCURRENCY_LOCK:
-        if _GLOBAL_LLM_CONCURRENCY_LIMIT is None:
-            _GLOBAL_LLM_CONCURRENCY_LIMIT = safe_limit
-            return safe_limit
-        return _GLOBAL_LLM_CONCURRENCY_LIMIT
+    if not _GLOBAL_CONCURRENCY_DEPRECATION_PRINTED:
+        print(
+            "[llm-client] llm_global_concurrency is deprecated and ignored (no semaphore cap)",
+            flush=True,
+        )
+        _GLOBAL_CONCURRENCY_DEPRECATION_PRINTED = True
+    return safe_limit
 
 
 def get_global_llm_concurrency() -> Optional[int]:
-    with _GLOBAL_LLM_CONCURRENCY_LOCK:
-        return _GLOBAL_LLM_CONCURRENCY_LIMIT
-
-
-def _get_global_llm_semaphore(max_concurrent_calls: int) -> asyncio.Semaphore:
-    effective_limit = configure_global_llm_concurrency(max_concurrent_calls)
-    loop = asyncio.get_running_loop()
-    with _GLOBAL_LLM_CONCURRENCY_LOCK:
-        sem = _GLOBAL_LLM_LOOP_SEMAPHORES.get(loop)
-        if sem is None:
-            sem = asyncio.Semaphore(effective_limit)
-            _GLOBAL_LLM_LOOP_SEMAPHORES[loop] = sem
-        return sem
+    return None
 
 
 def configure_global_llm_rpm(max_rpm: float) -> float:
@@ -149,6 +128,23 @@ def mark_global_llm_call_completed(schema_name: str) -> int:
         _GLOBAL_LLM_CALL_COUNT += 1
         current = _GLOBAL_LLM_CALL_COUNT
     print(f"[llm-call] completed={current} schema={schema_name}", flush=True)
+    return current
+
+
+def mark_global_llm_call_started(
+    schema_name: str,
+    *,
+    attempt: int,
+    mode: str,
+) -> int:
+    global _GLOBAL_LLM_CALL_START_COUNT
+    with _GLOBAL_LLM_CALL_COUNT_LOCK:
+        _GLOBAL_LLM_CALL_START_COUNT += 1
+        current = _GLOBAL_LLM_CALL_START_COUNT
+    print(
+        f"[llm-call] started={current} schema={schema_name} attempt={attempt} mode={mode}",
+        flush=True,
+    )
     return current
 
 
@@ -390,15 +386,13 @@ async def reset_openai_client(
 @asynccontextmanager
 async def global_llm_concurrency_guard(max_concurrent_calls: int):
     """
-    Process-wide LLM concurrency guard.
-    Every request (including retries) must pass this guard.
+    Deprecated compatibility shim. No semaphore concurrency cap is applied.
     """
-    sem = _get_global_llm_semaphore(max_concurrent_calls)
-    await sem.acquire()
+    del max_concurrent_calls
     try:
         yield
     finally:
-        sem.release()
+        return
 
 
 @asynccontextmanager
@@ -406,14 +400,11 @@ async def global_llm_rpm_guard(max_rpm: float):
     """
     Process-wide RPM pacing guard.
     Starts are evenly distributed at interval = 60 / rpm.
-    This guard is serial (one in-flight request globally), and pauses when idle.
+    This guard only paces request starts and does not serialize in-flight calls.
     """
     limiter = _get_global_llm_rpm_limiter(max_rpm)
     await limiter.acquire_slot()
-    try:
-        yield
-    finally:
-        limiter.release_slot()
+    yield
 
 
 def extract_error_code(exc: Exception) -> Optional[str]:
@@ -543,7 +534,7 @@ class LangChainJsonLLMClient:
     - network-call retries
     - parse retries
     - exponential backoff
-    - optional process-wide concurrency gate
+    - optional process-wide RPM pacing
     """
 
     def __init__(
@@ -585,11 +576,9 @@ class LangChainJsonLLMClient:
             if llm_global_rpm is not None and float(llm_global_rpm) > 0
             else None
         )
-        self.llm_global_concurrency = (
+        if llm_global_concurrency is not None:
             configure_global_llm_concurrency(llm_global_concurrency)
-            if (self.llm_global_rpm is None and llm_global_concurrency is not None)
-            else None
-        )
+        self.llm_global_concurrency = None
         self._local_call_count_lock = threading.Lock()
         self._local_call_count = 0
         self._last_recycle_ts = 0.0
@@ -714,32 +703,26 @@ class LangChainJsonLLMClient:
             try:
                 llm = self._bind_json_schema_llm(schema, schema_name)
                 call_started = time.monotonic()
-                if self.llm_global_rpm is not None:
-                    async with global_llm_rpm_guard(self.llm_global_rpm):
-                        if self.hard_timeout > 0:
-                            response = await asyncio.wait_for(
-                                llm.ainvoke(lc_messages),
-                                timeout=self.hard_timeout,
-                            )
-                        else:
-                            response = await llm.ainvoke(lc_messages)
-                elif self.llm_global_concurrency is not None:
-                    async with global_llm_concurrency_guard(self.llm_global_concurrency):
-                        if self.hard_timeout > 0:
-                            response = await asyncio.wait_for(
-                                llm.ainvoke(lc_messages),
-                                timeout=self.hard_timeout,
-                            )
-                        else:
-                            response = await llm.ainvoke(lc_messages)
-                else:
+                request_mode = "rpm" if self.llm_global_rpm is not None else "none"
+
+                async def _invoke_once() -> Any:
+                    mark_global_llm_call_started(
+                        schema_name,
+                        attempt=attempt + 1,
+                        mode=request_mode,
+                    )
                     if self.hard_timeout > 0:
-                        response = await asyncio.wait_for(
+                        return await asyncio.wait_for(
                             llm.ainvoke(lc_messages),
                             timeout=self.hard_timeout,
                         )
-                    else:
-                        response = await llm.ainvoke(lc_messages)
+                    return await llm.ainvoke(lc_messages)
+
+                if self.llm_global_rpm is not None:
+                    async with global_llm_rpm_guard(self.llm_global_rpm):
+                        response = await _invoke_once()
+                else:
+                    response = await _invoke_once()
                 if self.print_call_counter:
                     mark_global_llm_call_completed(schema_name)
                 call_elapsed = time.monotonic() - call_started
@@ -906,9 +889,8 @@ def build_json_llm_client_from_config(
     """
     Build LangChainJsonLLMClient from shared config keys.
     """
-    if llm_global_concurrency is None:
-        raw_global = config.get("llm_global_concurrency", 10)
-        llm_global_concurrency = int(raw_global) if raw_global is not None else None
+    if llm_global_concurrency is not None:
+        llm_global_concurrency = max(1, int(llm_global_concurrency))
     if llm_global_rpm is None:
         raw_rpm = config.get("llm_global_rpm", None)
         try:
@@ -917,9 +899,8 @@ def build_json_llm_client_from_config(
             parsed_rpm = 0.0
         if parsed_rpm > 0:
             llm_global_rpm = parsed_rpm
-        elif llm_global_concurrency is not None:
-            # Compatibility mapping: old "global_concurrency" now paces RPM.
-            llm_global_rpm = float(llm_global_concurrency)
+        else:
+            llm_global_rpm = None
 
     max_retries = max(0, int(config.get("max_retries", 8)))
     retry_delay = float(config.get("retry_delay", 2.0))
@@ -946,7 +927,6 @@ def build_json_llm_client_from_config(
         retry_backoff_factor,
         retry_max_delay,
         hard_timeout,
-        llm_global_concurrency,
         llm_global_rpm,
         effective_print_counter,
         effective_slow_threshold,
@@ -965,7 +945,7 @@ def build_json_llm_client_from_config(
             print(
                 "[llm-client] shared-json-client "
                 f"action=reuse id={id(shared)} llm_id={id(shared.llm)} "
-                f"mode={'rpm' if shared.llm_global_rpm is not None else 'concurrency'} "
+                f"mode={'rpm' if shared.llm_global_rpm is not None else 'none'} "
                 f"rpm={shared.llm_global_rpm or 0}",
                 flush=True,
             )
@@ -993,7 +973,7 @@ def build_json_llm_client_from_config(
         print(
             "[llm-client] shared-json-client "
             f"action=create id={id(shared)} llm_id={id(shared.llm)} "
-            f"mode={'rpm' if shared.llm_global_rpm is not None else 'concurrency'} "
+            f"mode={'rpm' if shared.llm_global_rpm is not None else 'none'} "
             f"rpm={shared.llm_global_rpm or 0}",
             flush=True,
         )

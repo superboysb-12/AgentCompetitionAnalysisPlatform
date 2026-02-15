@@ -2,7 +2,6 @@
 Relation extractor - extract structured product relations from plain text.
 """
 
-import asyncio
 import logging
 import re
 from pathlib import Path
@@ -98,7 +97,6 @@ class RelationExtractor:
                 30.0,
             ),
         )
-        self.semaphore = asyncio.Semaphore(RELATION_EXTRACTOR_CONFIG["max_concurrent"])
         self.llm_client = build_json_llm_client_from_config(
             self.llm,
             config=RELATION_EXTRACTOR_CONFIG,
@@ -146,49 +144,48 @@ class RelationExtractor:
         """
         Extract product relations from text and return a list of relation objects.
         """
-        async with self.semaphore:
-            try:
-                payload = await self.llm_client.call_json(
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                self.system_prompt
-                                or "You are a product information extraction expert. Only extract fields with evidence; if absent leave empty strings or empty arrays."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Extract product relations from the text below. "
-                                "IMPORTANT INSTRUCTIONS:\n"
-                                "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
-                                "- Use context from other pages only to complete information for products on the current page\n"
-                                "- If a table spans multiple pages, merge the information for products on the current page\n"
-                                "- If multiple product models are present (e.g., table rows), output one result per model\n"
-                                "- Do NOT merge specs across different models\n"
-                                "- Do NOT extract products that only appear in context pages\n\n"
-                                f"{text}"
-                            ),
-                        },
-                    ],
-                    RELATION_SCHEMA,
-                    "relation_schema",
-                )
-                results = payload.get("results", [])
-                processed = [self._post_process_item(item) for item in results]
-                return processed
-            except Exception as exc:  # noqa: BLE001
-                preview = (text or "")[:200]
-                self.logger.error(
-                    "Extraction failed: %s",
-                    exc,
-                    exc_info=True,
-                )
-                self.logger.error("Input text preview: %s...", preview)
-                if metadata:
-                    self.logger.error("Metadata: %s", metadata)
-                raise
+        try:
+            payload = await self.llm_client.call_json(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            self.system_prompt
+                            or "You are a product information extraction expert. Only extract fields with evidence; if absent leave empty strings or empty arrays."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Extract product relations from the text below. "
+                            "IMPORTANT INSTRUCTIONS:\n"
+                            "- If you see multiple pages in the context, FOCUS ONLY on the page marked as 'CURRENT PAGE'\n"
+                            "- Use context from other pages only to complete information for products on the current page\n"
+                            "- If a table spans multiple pages, merge the information for products on the current page\n"
+                            "- If multiple product models are present (e.g., table rows), output one result per model\n"
+                            "- Do NOT merge specs across different models\n"
+                            "- Do NOT extract products that only appear in context pages\n\n"
+                            f"{text}"
+                        ),
+                    },
+                ],
+                RELATION_SCHEMA,
+                "relation_schema",
+            )
+            results = payload.get("results", [])
+            processed = [self._post_process_item(item) for item in results]
+            return processed
+        except Exception as exc:  # noqa: BLE001
+            preview = (text or "")[:200]
+            self.logger.error(
+                "Extraction failed: %s",
+                exc,
+                exc_info=True,
+            )
+            self.logger.error("Input text preview: %s...", preview)
+            if metadata:
+                self.logger.error("Metadata: %s", metadata)
+            raise
 
     def _post_process_item(self, item: Dict) -> Dict:
         """Normalize fields, enforce units, and ensure required keys exist."""

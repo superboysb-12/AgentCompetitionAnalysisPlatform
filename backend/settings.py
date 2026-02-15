@@ -146,10 +146,11 @@ RELATION_EXTRACTOR_CONFIG = {
     "base_url": os.getenv("OPENAI_BASE_URL", "https://api.zhizengzeng.com/v1/"),
     "model": os.getenv("RELATION_MODEL", "gpt-4.1-mini"),
 
-    # Concurrency control
+    # Runtime scheduling controls
     "global_concurrency": int(os.getenv("GLOBAL_CONCURRENCY", os.getenv("MAX_CONCURRENT", "100"))),
     "max_concurrent": int(os.getenv("MAX_CONCURRENT", "100")),
-    # Process-wide in-flight LLM call cap shared by all request paths.
+    # Compatibility-only value (no process-wide semaphore cap).
+    # Used as default RPM when LLM_GLOBAL_RPM is not set.
     "llm_global_concurrency": int(
         os.getenv("LLM_GLOBAL_CONCURRENCY", 10)
     ),
